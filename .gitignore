@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+venv/
+.venv-old/
+venv-old/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Raw and generated EEG data
+data/raw/
+data/interim/
+data/processed/
+
+# Outputs
+outputs/
+
+# Large arrays
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db

@@ -1,0 +1,20 @@
+# EEG and deep learning
+braindecode
+mne
+mne-bids
+edfio
+
+# Scientific computing
+numpy
+scipy
+pandas
+scikit-learn
+
+# Visualization and utilities
+matplotlib
+tqdm
+
+# Development
+jupyterlab
+ipykernel
+pytest
