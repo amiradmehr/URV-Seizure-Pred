@@ -21,3 +21,4 @@ if not dataset_root.exists():
 
 # Now, loading the dataset is simply a one-line command:
 bids_ds = BIDSDataset(dataset_root)
+print(bids_ds.datasets[0].raw.annotations)
