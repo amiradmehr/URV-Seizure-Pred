@@ -17,6 +17,12 @@ data/processed/
 # Outputs
 outputs/
 
+# Local-only scripts and scratch work (not for the branch)
+local/
+
+# Editable-install metadata
+*.egg-info/
+
 # Large arrays
 *.npy
 *.npz

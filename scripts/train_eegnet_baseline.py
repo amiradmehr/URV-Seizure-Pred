@@ -16,6 +16,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_s
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -93,7 +95,18 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "outputs" / "models" / "eegnet_mean_pool",
     )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=100,
+        help="Print a running training summary every N batches (0 disables).",
+    )
     return parser.parse_args()
+
+
+def log(message: str) -> None:
+    """Print immediately so piped/background runs show live progress."""
+    print(message, flush=True)
 
 
 def set_seed(seed: int) -> None:
@@ -209,6 +222,8 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    *,
+    description: str = "Validating",
 ) -> dict[str, float]:
     """Evaluate loss and discrimination/calibration metrics without gradients."""
     model.eval()
@@ -218,7 +233,8 @@ def evaluate(
     probabilities: list[float] = []
 
     with torch.no_grad():
-        for signal, availability, target in loader:
+        progress = tqdm(loader, desc=description, unit="batch", leave=True)
+        for signal, availability, target in progress:
             signal = signal.to(device, non_blocking=True)
             availability = availability.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
@@ -229,6 +245,7 @@ def evaluate(
             total_examples += len(target)
             labels.extend(target.cpu().tolist())
             probabilities.extend(torch.sigmoid(logits).cpu().tolist())
+            progress.set_postfix(loss=f"{total_loss / total_examples:.4f}")
 
     return {
         "loss": total_loss / total_examples,
@@ -238,6 +255,9 @@ def evaluate(
 
 def main() -> None:
     """Train and checkpoint the EEGNet mean-pooling baseline."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     arguments = parse_arguments()
     CONFIG.validate()
     if arguments.epochs <= 0 or arguments.batch_size <= 0:
@@ -256,18 +276,25 @@ def main() -> None:
             "Run build_dataset.py and validate_dataset.py first."
         )
 
+    log(f"Device: {device}")
+    if device.type == "cuda":
+        log(f"GPU: {torch.cuda.get_device_name(device)}")
+
+    log("Loading training decision metadata...")
     train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=arguments.train_negative_ratio,
         seed=arguments.seed,
     )
+    log("Loading validation decision metadata...")
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=arguments.validation_negative_ratio,
         seed=arguments.seed,
     )
+    log("Building data loaders...")
     train_loader = build_loader(
         train_examples,
         shuffle=True,
@@ -311,31 +338,41 @@ def main() -> None:
     history: list[dict[str, Any]] = []
     best_average_precision = float("-inf")
 
-    print(f"Device: {device}")
-    print(
+    log(
         "Train decisions: "
         f"{len(train_examples)} "
         f"({train_positive_count} positive, {train_negative_count} negative)"
     )
-    print(
+    log(
         "Validation decisions: "
         f"{len(validation_examples)} "
         f"({int((validation_examples['label'] == 1).sum())} positive, "
         f"{int((validation_examples['label'] == 0).sum())} negative)"
     )
-    print(
+    log(
         "Each decision contains "
         f"{CONFIG.input_window_seconds / 60:.0f} minutes / "
         f"{CONFIG.input_window_seconds / CONFIG.chunk_window_seconds:.0f} chunks."
     )
 
     for epoch in range(1, arguments.epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         cumulative_loss = 0.0
         cumulative_correct = 0
         examples_seen = 0
 
-        for signal, availability, target in train_loader:
+        log(f"\n=== Epoch {epoch}/{arguments.epochs} ===")
+        train_progress = tqdm(
+            train_loader,
+            desc=f"Train epoch {epoch}",
+            unit="batch",
+            leave=True,
+        )
+        for batch_index, (signal, availability, target) in enumerate(
+            train_progress,
+            start=1,
+        ):
             signal = signal.to(device, non_blocking=True)
             availability = availability.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
@@ -352,11 +389,28 @@ def main() -> None:
             )
             examples_seen += len(target)
 
+            running_loss = cumulative_loss / examples_seen
+            running_accuracy = cumulative_correct / examples_seen
+            train_progress.set_postfix(
+                loss=f"{running_loss:.4f}",
+                acc=f"{running_accuracy:.3f}",
+            )
+
+            if (
+                arguments.log_interval > 0
+                and batch_index % arguments.log_interval == 0
+            ):
+                log(
+                    f"Epoch {epoch} batch {batch_index}/{len(train_loader)} "
+                    f"loss={running_loss:.4f} acc={running_accuracy:.3f}"
+                )
+
         validation_metrics = evaluate(
             model,
             validation_loader,
             criterion,
             device,
+            description=f"Validate epoch {epoch}",
         )
         epoch_metrics = {
             "epoch": epoch,
@@ -365,7 +419,14 @@ def main() -> None:
             **{f"validation_{name}": value for name, value in validation_metrics.items()},
         }
         history.append(epoch_metrics)
-        print(json.dumps(epoch_metrics, sort_keys=True))
+        elapsed_minutes = (time.perf_counter() - epoch_start) / 60.0
+        log(
+            f"Epoch {epoch} finished in {elapsed_minutes:.1f} min: "
+            f"train_loss={epoch_metrics['train_loss']:.4f} "
+            f"val_auc={epoch_metrics['validation_roc_auc']:.4f} "
+            f"val_ap={epoch_metrics['validation_average_precision']:.4f}"
+        )
+        log(json.dumps(epoch_metrics, sort_keys=True))
 
         if validation_metrics["average_precision"] > best_average_precision:
             best_average_precision = validation_metrics["average_precision"]
@@ -406,10 +467,10 @@ def main() -> None:
         )
 
     save_training_curves(history, curves_path)
-    print(f"Best checkpoint: {checkpoint_path}")
-    print(f"Training metrics: {metrics_path}")
-    print(f"Learning curves: {curves_path}")
-    print("The held-out test split was not used.")
+    log(f"Best checkpoint: {checkpoint_path}")
+    log(f"Training metrics: {metrics_path}")
+    log(f"Learning curves: {curves_path}")
+    log("The held-out test split was not used.")
 
 
 if __name__ == "__main__":
