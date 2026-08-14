@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from seizure_prediction.config import PreprocessingConfig
+
+
+def resolve_stored_path(path_value: str | Path) -> Path:
+    """Resolve manifest paths written on Windows when training inside WSL."""
+    path_text = str(path_value)
+    native_path = Path(path_text)
+    if native_path.exists() or os.name == "nt":
+        return native_path
+
+    windows_path = PureWindowsPath(path_text)
+    if windows_path.drive:
+        drive_name = windows_path.drive.rstrip(":").lower()
+        return Path("/mnt") / drive_name / Path(*windows_path.parts[1:])
+
+    return native_path
 
 
 def load_decision_examples(
@@ -53,12 +69,12 @@ def load_decision_examples(
     }
     for manifest_row in split_manifest.itertuples(index=False):
         metadata = pd.read_csv(
-            manifest_row.metadata_path,
+            resolve_stored_path(manifest_row.metadata_path),
             dtype=metadata_dtypes,
         )
-        metadata["X_path"] = str(manifest_row.X_path)
+        metadata["X_path"] = str(resolve_stored_path(manifest_row.X_path))
         metadata["channel_availability_path"] = str(
-            manifest_row.channel_availability_path
+            resolve_stored_path(manifest_row.channel_availability_path)
         )
         frames.append(metadata)
 
@@ -102,6 +118,82 @@ def load_decision_examples(
         raise ValueError(f"Split {split!r} has labels outside {{0, 1}}.")
 
     return examples.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+
+class BalancedEpochSampler(Sampler[int]):
+    """Use all positives and a fresh negative subset in every training epoch.
+
+    Negatives are drawn without replacement from one seeded permutation. This
+    guarantees that consecutive epochs do not reuse a negative until the full
+    negative pool has been traversed. The combined positive and negative
+    indices are shuffled independently for each epoch.
+    """
+
+    def __init__(
+        self,
+        labels: pd.Series | np.ndarray,
+        negative_to_positive_ratio: float = 1.0,
+        seed: int = 0,
+    ) -> None:
+        label_values = np.asarray(labels, dtype=np.int64)
+        if label_values.ndim != 1 or not np.isin(label_values, [0, 1]).all():
+            raise ValueError("labels must be one-dimensional binary values.")
+        if negative_to_positive_ratio <= 0:
+            raise ValueError("negative_to_positive_ratio must be positive.")
+
+        self.positive_indices = np.flatnonzero(label_values == 1)
+        negative_indices = np.flatnonzero(label_values == 0)
+        if len(self.positive_indices) == 0 or len(negative_indices) == 0:
+            raise ValueError("Balanced sampling requires both classes.")
+
+        self.negative_count = int(
+            round(len(self.positive_indices) * negative_to_positive_ratio)
+        )
+        if self.negative_count > len(negative_indices):
+            raise ValueError(
+                "Requested more unique negatives per epoch than are available."
+            )
+
+        self.seed = seed
+        self.epoch = 0
+        self.negative_indices = np.random.default_rng(seed).permutation(
+            negative_indices
+        )
+
+    def __len__(self) -> int:
+        return len(self.positive_indices) + self.negative_count
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the deterministic negative slice for a zero-based epoch."""
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative.")
+        self.epoch = epoch
+
+    def negative_indices_for_epoch(self, epoch: int) -> np.ndarray:
+        """Return the negative indices used by one epoch."""
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative.")
+
+        start = (epoch * self.negative_count) % len(self.negative_indices)
+        stop = start + self.negative_count
+        if stop <= len(self.negative_indices):
+            return self.negative_indices[start:stop].copy()
+
+        wrapped_count = stop - len(self.negative_indices)
+        return np.concatenate(
+            [
+                self.negative_indices[start:],
+                self.negative_indices[:wrapped_count],
+            ]
+        )
+
+    def __iter__(self):
+        negative_indices = self.negative_indices_for_epoch(self.epoch)
+        epoch_indices = np.concatenate(
+            [self.positive_indices, negative_indices]
+        )
+        epoch_rng = np.random.default_rng(self.seed + self.epoch + 1)
+        return iter(epoch_rng.permutation(epoch_indices).tolist())
 
 
 class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):

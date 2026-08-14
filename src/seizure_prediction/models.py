@@ -1,4 +1,4 @@
-"""Baseline neural-network models for streaming seizure-risk prediction."""
+"""The active seizure-prediction model: a minimal EEGNet baseline."""
 
 from __future__ import annotations
 
@@ -10,41 +10,40 @@ from torch import nn
 
 
 @dataclass(frozen=True)
-class EEGNetMeanPoolConfig:
-    """Configuration for the 45-minute EEGNet mean-pooling baseline."""
+class BaselineEEGNetConfig:
+    """Dimensions and regularization for the 45-minute EEGNet baseline."""
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
+    sequence_chunks: int = 45 * 60 // 5
     embedding_dim: int = 32
-    encoder_chunk_batch_size: int = 64
-    dropout: float = 0.25
+    encoder_chunk_batch_size: int = 128
+    dropout: float = 0.4
+    sampling_prior_logit_correction: float = 0.0
 
 
-class EEGNetMeanPoolRiskModel(nn.Module):
-    """Encode five-second EEG chunks with EEGNet and mean-pool over 45 minutes.
+class BaselineEEGNet(nn.Module):
+    """Predict next-10-minute seizure risk from 45 minutes of EEG.
 
-    The input contains a full streaming decision context with shape
-    ``(batch, chunks, channels, samples)``. Each chunk is encoded by the
-    Braindecode implementation of EEGNet, then all chunk embeddings receive
-    equal weight through mean pooling. A three-value electrode-availability
-    mask is concatenated to the pooled EEG representation before the final
-    binary risk classifier.
-
-    This is intentionally a simple baseline. It establishes a fair starting
-    point before replacing mean pooling with a recurrent or attention-based
-    temporal aggregation layer.
+    EEGNet independently converts each five-second chunk into a compact feature
+    vector. Mean pooling gives every chunk equal weight and intentionally
+    discards chunk order, making this a simple reference model rather than a
+    temporal sequence model. The pooled EEG representation and the three-value
+    electrode-availability mask feed one binary classifier.
     """
 
-    def __init__(self, config: EEGNetMeanPoolConfig) -> None:
+    def __init__(self, config: BaselineEEGNetConfig) -> None:
         super().__init__()
         if config.n_chans <= 0:
             raise ValueError("n_chans must be positive.")
-        if config.chunk_samples <= 0:
-            raise ValueError("chunk_samples must be positive.")
+        if config.chunk_samples <= 0 or config.sequence_chunks <= 0:
+            raise ValueError("chunk_samples and sequence_chunks must be positive.")
         if config.embedding_dim <= 0:
             raise ValueError("embedding_dim must be positive.")
         if config.encoder_chunk_batch_size <= 0:
             raise ValueError("encoder_chunk_batch_size must be positive.")
+        if not 0.0 <= config.dropout < 1.0:
+            raise ValueError("dropout must be at least zero and less than one.")
 
         self.config = config
         self.encoder = EEGNet(
@@ -60,10 +59,11 @@ class EEGNetMeanPoolRiskModel(nn.Module):
         )
 
     def _encode_chunks(self, chunks: torch.Tensor) -> torch.Tensor:
-        """Encode chunks in micro-batches to keep 45-minute contexts tractable."""
-        embeddings = []
-        for chunk_batch in chunks.split(self.config.encoder_chunk_batch_size):
-            embeddings.append(self.encoder(chunk_batch))
+        """Encode chunks in small groups to limit peak accelerator memory."""
+        embeddings = [
+            self.encoder(chunk_batch)
+            for chunk_batch in chunks.split(self.config.encoder_chunk_batch_size)
+        ]
         return torch.cat(embeddings, dim=0)
 
     def forward(
@@ -71,22 +71,20 @@ class EEGNetMeanPoolRiskModel(nn.Module):
         signal: torch.Tensor,
         channel_availability: torch.Tensor,
     ) -> torch.Tensor:
-        """Return one uncalibrated seizure-risk logit per 45-minute context."""
-        if signal.ndim != 4:
+        """Return one raw seizure-risk logit for each decision context."""
+        expected_signal_shape = (
+            self.config.sequence_chunks,
+            self.config.n_chans,
+            self.config.chunk_samples,
+        )
+        if signal.ndim != 4 or tuple(signal.shape[1:]) != expected_signal_shape:
             raise ValueError(
-                "signal must have shape (batch, chunks, channels, samples); "
-                f"found {tuple(signal.shape)}."
+                "signal must have shape (batch, chunks, channels, samples) with "
+                f"trailing dimensions {expected_signal_shape}; found "
+                f"{tuple(signal.shape)}."
             )
 
-        batch_size, number_of_chunks, channels, samples = signal.shape
-        if channels != self.config.n_chans or samples != self.config.chunk_samples:
-            raise ValueError(
-                "Unexpected EEG chunk shape: expected "
-                f"{self.config.n_chans} channels and "
-                f"{self.config.chunk_samples} samples, found "
-                f"{channels} channels and {samples} samples."
-            )
-
+        batch_size = signal.shape[0]
         if channel_availability.ndim == 1:
             channel_availability = channel_availability.unsqueeze(0)
         if channel_availability.shape != (batch_size, self.config.n_chans):
@@ -96,18 +94,16 @@ class EEGNetMeanPoolRiskModel(nn.Module):
             )
 
         flattened_chunks = signal.reshape(
-            batch_size * number_of_chunks,
-            channels,
-            samples,
+            batch_size * self.config.sequence_chunks,
+            self.config.n_chans,
+            self.config.chunk_samples,
         )
-        chunk_embeddings = self._encode_chunks(flattened_chunks)
-        chunk_embeddings = chunk_embeddings.reshape(
+        chunk_embeddings = self._encode_chunks(flattened_chunks).reshape(
             batch_size,
-            number_of_chunks,
+            self.config.sequence_chunks,
             self.config.embedding_dim,
         )
         pooled_embedding = chunk_embeddings.mean(dim=1)
-
         features = torch.cat(
             [
                 pooled_embedding,
@@ -125,5 +121,9 @@ class EEGNetMeanPoolRiskModel(nn.Module):
         signal: torch.Tensor,
         channel_availability: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the model's uncalibrated next-10-minute seizure probability."""
-        return torch.sigmoid(self(signal, channel_availability))
+        """Return probabilities corrected for negative subsampling."""
+        logits = self(signal, channel_availability)
+        corrected_logits = (
+            logits + self.config.sampling_prior_logit_correction
+        )
+        return torch.sigmoid(corrected_logits)
