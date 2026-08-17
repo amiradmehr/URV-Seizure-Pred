@@ -1,8 +1,8 @@
-# Virtual environment
+# Virtual environments
 .venv/
-
-# Data
-data/
+venv/
+.venv-old/
+venv-old/
 
 # Python
 __pycache__/
@@ -11,3 +11,25 @@ __pycache__/
 
 # OS
 .DS_Store
+.pytest_cache/
+
+# Raw and generated EEG data
+data/
+data/raw/
+data/interim/
+data/processed/
+
+# Outputs
+outputs/
+
+# Large arrays
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
