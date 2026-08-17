@@ -1,5 +1,6 @@
 """Central configuration for the SeizeIT2 preprocessing pipeline."""
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,6 +109,15 @@ class PreprocessingConfig:
         "CROSS_HEAD",
     )
 
+    # ------------------------------------------------------------------
+    # Experiment tagging
+    # ------------------------------------------------------------------
+
+    # When set, `interim_data_dir` and `processed_data_dir` nest under this
+    # tag so multiple configurations (e.g. a window/horizon sweep) can be
+    # built side by side without overwriting each other. See `build_config`.
+    experiment_tag: str | None = None
+
     @property
     def subject_split_map(self) -> dict[str, str]:
         """Return the configured split for every included subject."""
@@ -143,7 +153,8 @@ class PreprocessingConfig:
     @property
     def interim_data_dir(self) -> Path:
         """Temporary preprocessing output."""
-        return self.project_root / "data" / "seizeit2" / "interim"
+        base = self.project_root / "data" / "seizeit2" / "interim"
+        return base if self.experiment_tag is None else base / self.experiment_tag
 
     @property
     def unscaled_recordings_dir(self) -> Path:
@@ -163,7 +174,8 @@ class PreprocessingConfig:
     @property
     def processed_data_dir(self) -> Path:
         """Final standardized train, validation, and test shards."""
-        return self.project_root / "data" / "seizeit2" / "processed"
+        base = self.project_root / "data" / "seizeit2" / "processed"
+        return base if self.experiment_tag is None else base / self.experiment_tag
 
     def validate(self) -> None:
         """Validate configuration values before preprocessing starts."""
@@ -295,3 +307,34 @@ class PreprocessingConfig:
 
 
 CONFIG = PreprocessingConfig()
+
+
+def build_config(
+    window_minutes: float | None = None,
+    horizon_minutes: float | None = None,
+) -> PreprocessingConfig:
+    """Return a validated config for a given window/horizon combination.
+
+    With no arguments, returns the default `CONFIG` singleton unchanged.
+    Otherwise returns a new config with `input_window_seconds` and
+    `seizure_occurrence_period_minutes` overridden, tagged with a
+    `w{window}_h{horizon}` `experiment_tag` so its interim/processed
+    directories don't collide with any other combination's.
+    """
+    if window_minutes is None and horizon_minutes is None:
+        return CONFIG
+
+    if window_minutes is None:
+        window_minutes = CONFIG.input_window_seconds / 60.0
+    if horizon_minutes is None:
+        horizon_minutes = CONFIG.seizure_occurrence_period_minutes
+
+    tag = f"w{int(round(window_minutes))}_h{int(round(horizon_minutes))}"
+    config = dataclasses.replace(
+        CONFIG,
+        input_window_seconds=window_minutes * 60.0,
+        seizure_occurrence_period_minutes=horizon_minutes,
+        experiment_tag=tag,
+    )
+    config.validate()
+    return config

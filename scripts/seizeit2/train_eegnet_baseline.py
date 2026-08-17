@@ -48,7 +48,10 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.seizeit2.config import CONFIG  # noqa: E402
+from seizure_prediction.seizeit2.config import (  # noqa: E402
+    PreprocessingConfig,
+    build_config,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     StreamingDecisionDataset,
@@ -110,10 +113,26 @@ def parse_arguments() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument(
+        "--window-minutes",
+        type=float,
+        default=None,
+        help="Must match the value passed to build_dataset.py (default: 45).",
+    )
+    parser.add_argument(
+        "--horizon-minutes",
+        type=float,
+        default=None,
+        help="Must match the value passed to build_dataset.py (default: 10).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PROJECT_ROOT / "outputs" / "models" / "eegnet_baseline",
-        help="A separate directory is recommended for every experimental run.",
+        default=None,
+        help=(
+            "A separate directory is recommended for every experimental run. "
+            "Defaults to outputs/models/eegnet_baseline, nested under the "
+            "window/horizon combination's tag when one is given."
+        ),
     )
     return parser.parse_args()
 
@@ -163,6 +182,7 @@ def resolve_device(requested_device: str) -> torch.device:
 
 def build_loader(
     examples,
+    config: PreprocessingConfig,
     *,
     batch_size: int,
     num_workers: int,
@@ -171,7 +191,7 @@ def build_loader(
 ) -> DataLoader:
     """Build a lazy loader without copying complete recordings into memory."""
     return DataLoader(
-        StreamingDecisionDataset(examples, CONFIG),
+        StreamingDecisionDataset(examples, config),
         batch_size=batch_size,
         sampler=sampler,
         shuffle=False,
@@ -304,6 +324,7 @@ def save_learning_curves(
 
 def save_model_overview(
     config: BaselineEEGNetConfig,
+    preprocessing_config: PreprocessingConfig,
     output_path: Path,
 ) -> None:
     """Draw a presentation-ready overview of the active model architecture."""
@@ -312,16 +333,20 @@ def save_model_overview(
     axis.set_ylim(0.0, 1.0)
     axis.axis("off")
 
+    window_minutes = preprocessing_config.input_window_seconds / 60.0
+    horizon_minutes = preprocessing_config.seizure_occurrence_period_minutes
+
     box_width = 0.135
     box_height = 0.28
     box_y = 0.48
     box_x_values = (0.015, 0.18, 0.345, 0.51, 0.675, 0.84)
     labels = (
-        "45-min EEG input\n540 × 3 × 1,280",
+        f"{window_minutes:g}-min EEG input\n"
+        f"{config.sequence_chunks} × {config.n_chans} × {config.chunk_samples}",
         "Shared EEGNet\non each 5-s chunk",
-        f"Chunk features\n540 × {config.embedding_dim}",
+        f"Chunk features\n{config.sequence_chunks} × {config.embedding_dim}",
         f"Mean pooling\n{config.embedding_dim} features",
-        "Add electrode mask\n+ 3 availability values",
+        f"Add electrode mask\n+ {config.n_chans} availability values",
         "Linear classifier\n1 risk probability",
     )
 
@@ -355,7 +380,8 @@ def save_model_overview(
     axis.text(
         0.5,
         0.25,
-        "One output per decision: seizure onset within the next 10 minutes",
+        "One output per decision: seizure onset within the next "
+        f"{horizon_minutes:g} minutes",
         ha="center",
         va="center",
         fontsize=11,
@@ -378,6 +404,7 @@ def save_model_overview(
 
 def save_validation_summary(
     result: EvaluationResult,
+    horizon_minutes: float,
     output_path: Path,
 ) -> None:
     """Plot the best model's precision-recall curve and risk distributions."""
@@ -418,14 +445,14 @@ def save_validation_summary(
         bins=bins,
         density=True,
         alpha=0.55,
-        label="No seizure in next 10 min",
+        label=f"No seizure in next {horizon_minutes:g} min",
     )
     score_axis.hist(
         positive_scores,
         bins=bins,
         density=True,
         alpha=0.55,
-        label="Seizure in next 10 min",
+        label=f"Seizure in next {horizon_minutes:g} min",
     )
     score_axis.set(
         title="Validation risk-score distributions",
@@ -446,6 +473,7 @@ def save_metrics(
     *,
     output_path: Path,
     arguments: argparse.Namespace,
+    config: PreprocessingConfig,
     counts: dict[str, int],
     population_positive_fraction: float,
     sampled_positive_fraction: float,
@@ -465,6 +493,11 @@ def save_metrics(
                     "binary_cross_entropy",
                     "average_precision",
                 ],
+                "input_window_minutes": config.input_window_seconds / 60.0,
+                "seizure_occurrence_period_minutes": (
+                    config.seizure_occurrence_period_minutes
+                ),
+                "experiment_tag": config.experiment_tag,
                 "counts": counts,
                 "negative_to_positive_ratio_per_epoch": (
                     arguments.negative_to_positive_ratio
@@ -503,11 +536,11 @@ def main() -> None:
     """Train, select, checkpoint, and visualize the baseline EEGNet."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = build_config(arguments.window_minutes, arguments.horizon_minutes)
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Processed manifest not found: {manifest_path}. "
@@ -533,6 +566,7 @@ def main() -> None:
     )
     train_loader = build_loader(
         train_examples,
+        config,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
@@ -540,6 +574,7 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
+        config,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
@@ -557,10 +592,10 @@ def main() -> None:
     )
 
     model_config = BaselineEEGNetConfig(
-        n_chans=len(CONFIG.canonical_channel_names),
-        chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+        n_chans=len(config.canonical_channel_names),
+        chunk_samples=int(config.chunk_window_seconds * config.target_sfreq),
         sequence_chunks=int(
-            CONFIG.input_window_seconds / CONFIG.chunk_window_seconds
+            config.input_window_seconds / config.chunk_window_seconds
         ),
         embedding_dim=arguments.embedding_dim,
         encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
@@ -575,12 +610,17 @@ def main() -> None:
     )
     criterion = nn.BCEWithLogitsLoss()
 
-    arguments.output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = arguments.output_dir / "best_model.pt"
-    metrics_path = arguments.output_dir / "metrics.json"
-    model_overview_path = arguments.output_dir / "model_overview.png"
-    learning_curves_path = arguments.output_dir / "learning_curves.png"
-    validation_summary_path = arguments.output_dir / "validation_summary.png"
+    output_dir = arguments.output_dir or (
+        PROJECT_ROOT / "outputs" / "models" / "eegnet_baseline" / config.experiment_tag
+        if config.experiment_tag
+        else PROJECT_ROOT / "outputs" / "models" / "eegnet_baseline"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "best_model.pt"
+    metrics_path = output_dir / "metrics.json"
+    model_overview_path = output_dir / "model_overview.png"
+    learning_curves_path = output_dir / "learning_curves.png"
+    validation_summary_path = output_dir / "validation_summary.png"
     counts = {
         "all_training_decisions": len(train_examples),
         "training_positive_decisions": train_positive_count,
@@ -610,7 +650,7 @@ def main() -> None:
         "Primary model-comparison metric: average precision on the full "
         "natural-prevalence validation split."
     )
-    save_model_overview(model_config, model_overview_path)
+    save_model_overview(model_config, config, model_overview_path)
 
     for epoch in range(1, arguments.epochs + 1):
         train_sampler.set_epoch(epoch - 1)
@@ -691,6 +731,7 @@ def main() -> None:
         save_metrics(
             output_path=metrics_path,
             arguments=arguments,
+            config=config,
             counts=counts,
             population_positive_fraction=population_positive_fraction,
             sampled_positive_fraction=sampled_positive_fraction,
@@ -727,7 +768,11 @@ def main() -> None:
         validation_prevalence,
         learning_curves_path,
     )
-    save_validation_summary(best_validation_result, validation_summary_path)
+    save_validation_summary(
+        best_validation_result,
+        config.seizure_occurrence_period_minutes,
+        validation_summary_path,
+    )
 
     print(f"Best validation AP: {best_average_precision:.6f} at epoch {best_epoch}")
     print(f"Checkpoint: {checkpoint_path}")

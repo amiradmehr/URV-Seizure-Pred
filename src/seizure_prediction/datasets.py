@@ -197,7 +197,7 @@ class BalancedEpochSampler(Sampler[int]):
 
 
 class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
-    """Lazily extract one 45-minute decision context from continuous EEG."""
+    """Lazily extract one configured-length decision context from continuous EEG."""
 
     def __init__(
         self,
@@ -259,7 +259,8 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
 
         if decision_end - history_start != self.history_samples:
             raise ValueError(
-                "Decision metadata does not contain the configured 45-minute "
+                "Decision metadata does not contain the configured "
+                f"{self.config.input_window_seconds / 60.0:g}-minute "
                 "history length."
             )
         if history_start < 0 or decision_end > signal.shape[1]:

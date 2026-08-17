@@ -4,10 +4,14 @@ Validate the processed SeizeIT2 dataset.
 Run from the repository root:
 
     python scripts/seizeit2/validate_dataset.py
+
+Pass --window-minutes/--horizon-minutes to validate a build produced with
+the same override (they must match the flags given to build_dataset.py).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -23,10 +27,31 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.seizeit2.config import CONFIG  # noqa: E402
+from seizure_prediction.seizeit2.config import (  # noqa: E402
+    PreprocessingConfig,
+    build_config,
+)
 from seizure_prediction.seizeit2.preprocessing import (  # noqa: E402
     verify_patient_split_isolation,
 )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line options for validating a specific build."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--window-minutes",
+        type=float,
+        default=None,
+        help="Must match the value passed to build_dataset.py.",
+    )
+    parser.add_argument(
+        "--horizon-minutes",
+        type=float,
+        default=None,
+        help="Must match the value passed to build_dataset.py.",
+    )
+    return parser.parse_args()
 
 
 SEPARATOR = "=" * 90
@@ -40,10 +65,10 @@ def print_header(title: str) -> None:
     print(SEPARATOR)
 
 
-def load_processed_manifest() -> pd.DataFrame:
+def load_processed_manifest(config: PreprocessingConfig) -> pd.DataFrame:
     """Load the generated processed-shard manifest."""
     manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "processed_shard_manifest.csv"
     )
 
@@ -58,6 +83,7 @@ def load_processed_manifest() -> pd.DataFrame:
 
 def validate_single_shard(
     manifest_row: pd.Series,
+    config: PreprocessingConfig,
 ) -> dict[str, object]:
     """
     Validate one processed shard and return summary statistics.
@@ -121,7 +147,7 @@ def validate_single_shard(
             dtype=np.int8,
         )
 
-    if channel_names != list(CONFIG.canonical_channel_names):
+    if channel_names != list(config.canonical_channel_names):
         raise ValueError(
             f"Unexpected channel layout in {channels_path}: "
             f"{channel_names}"
@@ -170,8 +196,8 @@ def validate_single_shard(
 
     expected_history_samples = int(
         round(
-            CONFIG.target_sfreq
-            * CONFIG.input_window_seconds
+            config.target_sfreq
+            * config.input_window_seconds
         )
     )
 
@@ -199,11 +225,12 @@ def validate_single_shard(
 
     if not history_lengths.eq(expected_history_samples).all():
         raise ValueError(
-            f"Incorrect 45-minute history length in {metadata_path}."
+            f"Incorrect {config.input_window_seconds / 60.0:g}-minute "
+            f"history length in {metadata_path}."
         )
 
     expected_chunk_samples = int(
-        round(CONFIG.chunk_window_seconds * CONFIG.target_sfreq)
+        round(config.chunk_window_seconds * config.target_sfreq)
     )
     expected_chunks_per_history = (
         expected_history_samples // expected_chunk_samples
@@ -224,7 +251,7 @@ def validate_single_shard(
         )
 
     expected_occurrence_seconds = (
-        CONFIG.seizure_occurrence_period_minutes * 60.0
+        config.seizure_occurrence_period_minutes * 60.0
     )
     occurrence_lengths = (
         metadata["prediction_stop_seconds"]
@@ -364,10 +391,10 @@ def validate_single_shard(
     }
 
 
-def load_window_manifest() -> pd.DataFrame:
+def load_window_manifest(config: PreprocessingConfig) -> pd.DataFrame:
     """Load complete decision metadata with stable subject IDs."""
     window_manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "decision_manifest.csv"
     )
 
@@ -387,7 +414,7 @@ def load_window_manifest() -> pd.DataFrame:
         },
     )
 
-def validate_patient_split_isolation() -> list[str]:
+def validate_patient_split_isolation(config: PreprocessingConfig) -> list[str]:
     """Verify observed patients stay in their configured split.
 
     A configured patient may legitimately have no retained decision points
@@ -395,12 +422,12 @@ def validate_patient_split_isolation() -> list[str]:
     has no shard and cannot leak across splits, so it is reported rather than
     treated as a split-isolation error.
     """
-    metadata = load_window_manifest()
-    verify_patient_split_isolation(metadata, CONFIG)
+    metadata = load_window_manifest(config)
+    verify_patient_split_isolation(metadata, config)
 
     observed_subjects = set(metadata["subject"].map(str))
     missing_subjects = sorted(
-        set(CONFIG.included_subjects) - observed_subjects
+        set(config.included_subjects) - observed_subjects
     )
 
     if missing_subjects:
@@ -412,14 +439,14 @@ def validate_patient_split_isolation() -> list[str]:
     return missing_subjects
 
 
-def validate_seizure_split_overlap() -> None:
+def validate_seizure_split_overlap(config: PreprocessingConfig) -> None:
     """
     Report seizure IDs appearing in multiple splits.
 
     A patient-level split should keep every target seizure in exactly one
     split. This check makes any violation visible.
     """
-    metadata = load_window_manifest()
+    metadata = load_window_manifest(config)
 
     positives = metadata[
         metadata["label"] == 1
@@ -464,9 +491,9 @@ def validate_seizure_split_overlap() -> None:
     )
 
 
-def validate_target_seizure_eligibility() -> None:
+def validate_target_seizure_eligibility(config: PreprocessingConfig) -> None:
     """Ensure every positive decision targets a 60-minute-clear seizure."""
-    seizure_manifest_path = CONFIG.manifests_dir / "seizure_manifest.csv"
+    seizure_manifest_path = config.manifests_dir / "seizure_manifest.csv"
 
     if not seizure_manifest_path.exists():
         raise FileNotFoundError(
@@ -484,7 +511,7 @@ def validate_target_seizure_eligibility() -> None:
         seizures["eligible_for_prediction"].astype(str).str.lower().eq("true")
     )
     eligible_ids = set(seizures.loc[eligibility_mask, "seizure_id"].astype(str))
-    positives = load_window_manifest().query("label == 1")
+    positives = load_window_manifest(config).query("label == 1")
     target_ids = set(positives["target_seizure_id"].dropna().astype(str))
     ineligible_ids = sorted(target_ids - eligible_ids)
 
@@ -495,9 +522,9 @@ def validate_target_seizure_eligibility() -> None:
         )
 
 
-def validate_split_class_coverage() -> None:
+def validate_split_class_coverage(config: PreprocessingConfig) -> None:
     """Require each split to include positive and negative decisions."""
-    metadata = load_window_manifest()
+    metadata = load_window_manifest(config)
     expected_labels = {0, 1}
 
     for split_name, split_metadata in metadata.groupby("split", sort=True):
@@ -552,10 +579,10 @@ def validate_training_standardization(
         )
 
 
-def validate_global_scaler() -> None:
+def validate_global_scaler(config: PreprocessingConfig) -> None:
     """Confirm the saved global scaler was fit from training patients only."""
     scaler_path = (
-        CONFIG.scaler_parameters_dir
+        config.scaler_parameters_dir
         / "global_channel_zscore.json"
     )
 
@@ -567,7 +594,7 @@ def validate_global_scaler() -> None:
     with scaler_path.open("r", encoding="utf-8") as scaler_file:
         scaler = json.load(scaler_file)
 
-    if scaler.get("channel_names") != list(CONFIG.canonical_channel_names):
+    if scaler.get("channel_names") != list(config.canonical_channel_names):
         raise ValueError(
             "Global scaler channel layout does not match the configured "
             "canonical layout."
@@ -578,20 +605,21 @@ def validate_global_scaler() -> None:
     if not scaler_subjects:
         raise ValueError("Global scaler records no training subjects.")
 
-    if not scaler_subjects.issubset(set(CONFIG.train_subjects)):
+    if not scaler_subjects.issubset(set(config.train_subjects)):
         raise ValueError(
             "Global scaler includes validation/test subjects: "
-            f"{sorted(scaler_subjects - set(CONFIG.train_subjects))}"
+            f"{sorted(scaler_subjects - set(config.train_subjects))}"
         )
 
 
 def main() -> None:
     """Run all validation checks."""
-    CONFIG.validate()
+    arguments = parse_arguments()
+    config = build_config(arguments.window_minutes, arguments.horizon_minutes)
 
     print_header("PROCESSED SEIZEIT2 VALIDATION")
 
-    processed_manifest = load_processed_manifest()
+    processed_manifest = load_processed_manifest(config)
 
     if processed_manifest.empty:
         raise ValueError(
@@ -605,7 +633,7 @@ def main() -> None:
         start=1,
     ):
         summary = validate_single_shard(
-            manifest_row
+            manifest_row, config
         )
 
         shard_summaries.append(summary)
@@ -626,7 +654,7 @@ def main() -> None:
 
     print_header("PATIENT-LEVEL SPLIT VALIDATION")
 
-    excluded_subjects = validate_patient_split_isolation()
+    excluded_subjects = validate_patient_split_isolation(config)
     print(
         "Patient split isolation: PASS"
         + (
@@ -636,13 +664,13 @@ def main() -> None:
         )
     )
 
-    validate_seizure_split_overlap()
+    validate_seizure_split_overlap(config)
     print("Seizure split isolation: PASS")
 
-    validate_target_seizure_eligibility()
+    validate_target_seizure_eligibility(config)
     print("Target-seizure 60-minute eligibility: PASS")
 
-    validate_split_class_coverage()
+    validate_split_class_coverage(config)
     print("Split class coverage: PASS")
 
     validate_training_standardization(
@@ -650,7 +678,7 @@ def main() -> None:
     )
     print("Standardization sanity checks: PASS")
 
-    validate_global_scaler()
+    validate_global_scaler(config)
     print("Global train-only scaler provenance: PASS")
 
     print_header("DATASET SUMMARY")
@@ -677,7 +705,7 @@ def main() -> None:
     print(split_summary.to_string(index=False))
 
     output_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "validation_summary.csv"
     )
 

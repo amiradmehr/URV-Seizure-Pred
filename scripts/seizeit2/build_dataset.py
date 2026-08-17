@@ -4,6 +4,12 @@ Build the filtered, labeled, patient-level split SeizeIT2 dataset.
 Run from the repository root:
 
     python scripts/seizeit2/build_dataset.py
+
+Pass --window-minutes/--horizon-minutes to build a different training
+window or prediction horizon; the output nests under a tagged
+subdirectory (e.g. data/seizeit2/processed/w30_h5/) so combinations can
+coexist. Never pass --resume across two different combinations — resumed
+checkpoints reuse a prior run's decision labels as-is.
 """
 
 from __future__ import annotations
@@ -25,7 +31,10 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.seizeit2.config import CONFIG  # noqa: E402
+from seizure_prediction.seizeit2.config import (  # noqa: E402
+    PreprocessingConfig,
+    build_config,
+)
 from seizure_prediction.seizeit2.preprocessing import (  # noqa: E402
     assign_patient_splits,
     channel_availability_mask,
@@ -69,15 +78,35 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help=(
             "Reuse validated unscaled recording checkpoints and process only "
-            "missing or incomplete recordings."
+            "missing or incomplete recordings. Never combine with a "
+            "--window-minutes/--horizon-minutes value different from the "
+            "run being resumed."
+        ),
+    )
+    parser.add_argument(
+        "--window-minutes",
+        type=float,
+        default=None,
+        help="Override the training window length (default: 45 minutes).",
+    )
+    parser.add_argument(
+        "--horizon-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Override the seizure-occurrence prediction horizon "
+            "(default: 10 minutes)."
         ),
     )
     return parser.parse_args()
 
 
-def checkpoint_paths(recording_id: str) -> tuple[Path, Path, Path, Path]:
+def checkpoint_paths(
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> tuple[Path, Path, Path, Path]:
     """Return the four required unscaled-recording checkpoint paths."""
-    directory = CONFIG.unscaled_recordings_dir
+    directory = config.unscaled_recordings_dir
     return (
         directory / f"{recording_id}.npy",
         directory / f"{recording_id}.csv",
@@ -86,16 +115,19 @@ def checkpoint_paths(recording_id: str) -> tuple[Path, Path, Path, Path]:
     )
 
 
-def discard_checkpoint(recording_id: str) -> None:
+def discard_checkpoint(recording_id: str, config: PreprocessingConfig) -> None:
     """Remove only the known generated files for one incomplete recording."""
-    for checkpoint_path in checkpoint_paths(recording_id):
+    for checkpoint_path in checkpoint_paths(recording_id, config):
         checkpoint_path.unlink(missing_ok=True)
 
 
-def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
+def load_resumable_checkpoint(
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> pd.DataFrame | None:
     """Return validated saved decision metadata, or discard a bad checkpoint."""
     array_path, metadata_path, channels_path, availability_path = checkpoint_paths(
-        recording_id
+        recording_id, config
     )
     paths = (array_path, metadata_path, channels_path, availability_path)
 
@@ -107,7 +139,7 @@ def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
             raise ValueError("one or more required checkpoint files are missing")
 
         signal = np.load(array_path, mmap_mode="r")
-        if signal.ndim != 2 or signal.shape[0] != len(CONFIG.canonical_channel_names):
+        if signal.ndim != 2 or signal.shape[0] != len(config.canonical_channel_names):
             raise ValueError(f"unexpected signal shape {signal.shape}")
         if signal.shape[1] <= 0:
             raise ValueError("recording contains no samples")
@@ -117,12 +149,12 @@ def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
 
         with channels_path.open("r", encoding="utf-8") as channel_file:
             channel_names = json.load(channel_file)
-        if channel_names != list(CONFIG.canonical_channel_names):
+        if channel_names != list(config.canonical_channel_names):
             raise ValueError(f"unexpected channel layout {channel_names}")
 
         with availability_path.open("r", encoding="utf-8") as availability_file:
             availability = np.asarray(json.load(availability_file), dtype=np.int8)
-        if availability.shape != (len(CONFIG.canonical_channel_names),) or not np.isin(
+        if availability.shape != (len(config.canonical_channel_names),) or not np.isin(
             availability,
             [0, 1],
         ).all():
@@ -152,7 +184,7 @@ def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
 
         return metadata
     except (ValueError, KeyError, json.JSONDecodeError, EOFError) as error:
-        discard_checkpoint(recording_id)
+        discard_checkpoint(recording_id, config)
         print(f"    Discarded incomplete checkpoint: {error}")
         return None
     except OSError as error:
@@ -191,42 +223,42 @@ def seizure_metadata_from_resumed_checkpoint(
 def main() -> None:
     """Execute the complete preprocessing workflow."""
     arguments = parse_arguments()
-    CONFIG.validate()
+    config = build_config(arguments.window_minutes, arguments.horizon_minutes)
 
     print_header("SEIZEIT2 PREPROCESSING PIPELINE")
 
-    print(f"Project root:       {CONFIG.project_root}")
-    print(f"Raw dataset:        {CONFIG.raw_data_dir}")
-    print(f"Interim output:     {CONFIG.interim_data_dir}")
-    print(f"Processed output:   {CONFIG.processed_data_dir}")
+    print(f"Project root:       {config.project_root}")
+    print(f"Raw dataset:        {config.raw_data_dir}")
+    print(f"Interim output:     {config.interim_data_dir}")
+    print(f"Processed output:   {config.processed_data_dir}")
     print(
         "Subjects:           "
-        f"{len(CONFIG.included_subjects)} configured "
+        f"{len(config.included_subjects)} configured "
         "patient-level subjects"
     )
 
     if arguments.resume:
-        CONFIG.unscaled_recordings_dir.mkdir(parents=True, exist_ok=True)
+        config.unscaled_recordings_dir.mkdir(parents=True, exist_ok=True)
         print("Resume mode: validated existing recordings will be reused.")
     else:
-        clear_generated_directory(CONFIG.unscaled_recordings_dir)
+        clear_generated_directory(config.unscaled_recordings_dir)
 
     # Final shards and aggregate manifests are rebuilt from the complete
     # checkpoint set after pass 1, whether this is a fresh run or a resume.
     clear_generated_directory(
-        CONFIG.processed_data_dir
+        config.processed_data_dir
     )
 
-    clear_generated_directory(CONFIG.manifests_dir)
+    clear_generated_directory(config.manifests_dir)
 
-    CONFIG.scaler_parameters_dir.mkdir(
+    config.scaler_parameters_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     recordings = load_bids_recordings(
-        config=CONFIG,
-        subjects=CONFIG.included_subjects,
+        config=config,
+        subjects=config.included_subjects,
         preload=False,
     )
 
@@ -239,7 +271,7 @@ def main() -> None:
         extract_recording_entities(recording.description)["subject"]
         for recording in recordings
     }
-    missing_subjects = sorted(set(CONFIG.included_subjects) - loaded_subjects)
+    missing_subjects = sorted(set(config.included_subjects) - loaded_subjects)
 
     if missing_subjects:
         raise RuntimeError(
@@ -277,14 +309,14 @@ def main() -> None:
         )
 
         resumed_metadata = (
-            load_resumable_checkpoint(recording_id)
+            load_resumable_checkpoint(recording_id, config)
             if arguments.resume
             else None
         )
 
         if resumed_metadata is not None:
             events_path = find_events_file(
-                dataset_root=CONFIG.raw_data_dir,
+                dataset_root=config.raw_data_dir,
                 entities=entities,
             )
             seizure_events = read_seizure_events(
@@ -307,7 +339,7 @@ def main() -> None:
             continue
 
         events_path = find_events_file(
-            dataset_root=CONFIG.raw_data_dir,
+            dataset_root=config.raw_data_dir,
             entities=entities,
         )
 
@@ -319,11 +351,11 @@ def main() -> None:
 
         raw = recording.load_raw()
         bte_side = infer_bte_side(raw)
-        availability = channel_availability_mask(raw, CONFIG)
+        availability = channel_availability_mask(raw, config)
 
         processed_raw = filter_and_prepare(
             raw=raw,
-            config=CONFIG,
+            config=config,
         )
         del raw
 
@@ -334,7 +366,7 @@ def main() -> None:
                 recording_events=recording_events,
                 entities=entities,
                 bte_side=bte_side,
-                config=CONFIG,
+                config=config,
             )
         )
 
@@ -369,14 +401,14 @@ def main() -> None:
 
         save_unscaled_recording(
             signal=processed_raw.get_data().astype(
-                CONFIG.signal_dtype,
+                config.signal_dtype,
                 copy=False,
             ),
             decision_metadata=metadata_recording,
             channel_names=processed_raw.ch_names,
             channel_availability=availability,
             output_directory=(
-                CONFIG.unscaled_recordings_dir
+                config.unscaled_recordings_dir
             ),
             recording_id=recording_id,
         )
@@ -423,19 +455,19 @@ def main() -> None:
     window_metadata = (
         assign_patient_splits(
             metadata=window_metadata,
-            config=CONFIG,
+            config=config,
         )
     )
 
-    verify_patient_split_isolation(window_metadata, CONFIG)
+    verify_patient_split_isolation(window_metadata, config)
 
     window_manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "decision_manifest.csv"
     )
 
     seizure_manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "seizure_manifest.csv"
     )
 
@@ -499,15 +531,15 @@ def main() -> None:
     scaler = fit_global_channel_scaler(
         metadata=window_metadata,
         unscaled_recordings_dir=(
-            CONFIG.unscaled_recordings_dir
+            config.unscaled_recordings_dir
         ),
-        epsilon=CONFIG.zscore_epsilon,
-        config=CONFIG,
+        epsilon=config.zscore_epsilon,
+        config=config,
     )
 
     patient_summary = patient_class_summary(window_metadata)
     patient_summary_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "patient_class_summary.csv"
     )
     patient_summary.to_csv(patient_summary_path, index=False)
@@ -516,7 +548,7 @@ def main() -> None:
     print(patient_summary.to_string(index=False))
 
     scaler_path = (
-        CONFIG.scaler_parameters_dir
+        config.scaler_parameters_dir
         / "global_channel_zscore.json"
     )
 
@@ -540,17 +572,17 @@ def main() -> None:
     processed_manifest = write_standardized_shards(
         metadata=window_metadata,
         unscaled_recordings_dir=(
-            CONFIG.unscaled_recordings_dir
+            config.unscaled_recordings_dir
         ),
         processed_data_dir=(
-            CONFIG.processed_data_dir
+            config.processed_data_dir
         ),
         scaler=scaler,
-        output_dtype=CONFIG.signal_dtype,
+        output_dtype=config.signal_dtype,
     )
 
     processed_manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "processed_shard_manifest.csv"
     )
 
@@ -592,12 +624,18 @@ def main() -> None:
     )
     print(
         f"Processed data:     "
-        f"{CONFIG.processed_data_dir}"
+        f"{config.processed_data_dir}"
     )
+
+    sweep_flags = ""
+    if arguments.window_minutes is not None:
+        sweep_flags += f" --window-minutes {arguments.window_minutes:g}"
+    if arguments.horizon_minutes is not None:
+        sweep_flags += f" --horizon-minutes {arguments.horizon_minutes:g}"
 
     print(
         "\nNext command:\n"
-        "    python scripts/seizeit2/validate_dataset.py"
+        f"    python scripts/seizeit2/validate_dataset.py{sweep_flags}"
     )
 
 
