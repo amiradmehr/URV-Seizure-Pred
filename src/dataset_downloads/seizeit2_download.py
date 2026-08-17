@@ -4,9 +4,9 @@ import openneuro
 
 from braindecode.datasets import BIDSDataset
 
-data_dir = Path("~/mne_data/openneuro/").expanduser() # Downloads to the user directory
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 dataset_name = "ds005873"
-dataset_root = data_dir / dataset_name
+dataset_root = PROJECT_ROOT / "data" / "seizeit2" / "raw"
 
 if not dataset_root.exists():
     openneuro.download(

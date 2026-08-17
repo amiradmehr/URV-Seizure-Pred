@@ -191,18 +191,15 @@ class PreprocessingConfig:
         Root of the downloaded BIDS dataset.
 
         ``src/dataset_downloads/chb_mit_download.py`` fetches the dataset
-        into the user's MNE data directory, so that location is the
-        default.  Set ``CHB_MIT_BIDS_ROOT`` to read from elsewhere.
+        into ``data/chb_mit/raw`` inside the project, so that location is
+        the default.  Set ``CHB_MIT_BIDS_ROOT`` to read from elsewhere.
         """
         override = os.environ.get("CHB_MIT_BIDS_ROOT")
 
         if override:
             return Path(override).expanduser().resolve()
 
-        return (
-            Path("~/mne_data/openneuro/BIDS_CHB-MIT")
-            .expanduser()
-        )
+        return self.project_root / "data" / "chb_mit" / "raw" / "BIDS_CHB-MIT"
 
     @property
     def interim_data_dir(self) -> Path:

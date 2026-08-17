@@ -6,7 +6,8 @@ from braindecode.datasets import CHBMIT
 from braindecode.datasets.chb_mit import CHB_MIT_dataset_params
 from braindecode.datasets.utils import _correct_dataset_path
 
-data_dir = Path("~/mne_data/openneuro/").expanduser() # Downloads to the user directory
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+data_dir = PROJECT_ROOT / "data" / "chb_mit" / "raw"
 dataset_root = data_dir / "BIDS_CHB-MIT"
 
 if not dataset_root.exists():
