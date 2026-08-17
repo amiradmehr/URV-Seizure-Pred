@@ -1,8 +1,6 @@
-"""Preprocessing and modeling tools for seizure prediction research."""
+"""Preprocessing and modeling tools for seizure prediction research.
 
-from .config import CONFIG, PreprocessingConfig
-
-__all__ = [
-    "CONFIG",
-    "PreprocessingConfig",
-]
+Dataset-specific configuration and preprocessing live in the ``seizeit2``
+and ``chb_mit`` subpackages; this top-level package holds only the
+dataset-agnostic pieces (``datasets``, ``models``, ``models_temporal``).
+"""

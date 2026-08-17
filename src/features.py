@@ -1,1 +1,0 @@
-# Baseline feature extraction (RMS, entropy, etc.)

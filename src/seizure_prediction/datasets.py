@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from seizure_prediction.config import PreprocessingConfig
+from seizure_prediction.seizeit2.config import PreprocessingConfig
 
 
 def resolve_stored_path(path_value: str | Path) -> Path:
