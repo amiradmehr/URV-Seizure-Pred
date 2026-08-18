@@ -162,6 +162,27 @@ class PreprocessingConfig:
         return self.interim_data_dir / "unscaled_recordings"
 
     @property
+    def filtered_recordings_dir(self) -> Path:
+        """Bandpass/notch-filtered recordings shared across every combo.
+
+        Filtering depends only on `bandpass_low_hz`, `bandpass_high_hz`,
+        `notch_frequency_hz`, `target_sfreq`, and `canonical_channel_names`
+        -- none of which vary across a window/horizon sweep -- so this cache
+        is intentionally NOT nested under `experiment_tag`. A window/horizon
+        sweep should filter each raw EDF once here and reuse it for every
+        combination, instead of repeating the most expensive pipeline step
+        once per combination.
+        """
+        return (
+            self.project_root
+            / "data"
+            / "seizeit2"
+            / "interim"
+            / "_shared"
+            / "filtered_recordings"
+        )
+
+    @property
     def manifests_dir(self) -> Path:
         """Metadata tables generated during preprocessing."""
         return self.interim_data_dir / "manifests"
@@ -294,6 +315,7 @@ class PreprocessingConfig:
         directories = [
             self.interim_data_dir,
             self.unscaled_recordings_dir,
+            self.filtered_recordings_dir,
             self.manifests_dir,
             self.scaler_parameters_dir,
             self.processed_data_dir,

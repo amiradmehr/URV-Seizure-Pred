@@ -1304,6 +1304,125 @@ def save_unscaled_recording(
     return array_path, metadata_path
 
 
+def save_filtered_recording_cache(
+    raw: mne.io.BaseRaw,
+    bte_side: str,
+    channel_availability: np.ndarray,
+    output_directory: Path,
+    recording_id: str,
+) -> None:
+    """Cache one filtered recording so every window/horizon combo can reuse it.
+
+    Filtering (bandpass, notch, channel canonicalization) never depends on
+    the window/horizon configuration, so this cache is shared across every
+    combination in a sweep instead of being recomputed for each one.
+    """
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    array_path = output_directory / f"{recording_id}.npy"
+    channels_path = output_directory / f"{recording_id}_channels.json"
+    availability_path = output_directory / f"{recording_id}_channel_availability.json"
+    bte_side_path = output_directory / f"{recording_id}_bte_side.json"
+    annotations_path = output_directory / f"{recording_id}_annotations.json"
+
+    np.save(array_path, raw.get_data())
+
+    with channels_path.open("w", encoding="utf-8") as channel_file:
+        json.dump(list(raw.ch_names), channel_file, indent=2)
+
+    availability = np.asarray(channel_availability, dtype=bool)
+    with availability_path.open("w", encoding="utf-8") as availability_file:
+        json.dump(availability.astype(int).tolist(), availability_file, indent=2)
+
+    with bte_side_path.open("w", encoding="utf-8") as bte_side_file:
+        json.dump(bte_side, bte_side_file)
+
+    with annotations_path.open("w", encoding="utf-8") as annotations_file:
+        json.dump(
+            {
+                "onset": raw.annotations.onset.tolist(),
+                "duration": raw.annotations.duration.tolist(),
+                "description": list(raw.annotations.description),
+            },
+            annotations_file,
+            indent=2,
+        )
+
+
+def load_filtered_recording_cache(
+    recording_id: str,
+    directory: Path,
+    config: PreprocessingConfig,
+) -> tuple[mne.io.BaseRaw, str, np.ndarray] | None:
+    """Return a cached filtered recording, or None if none is cached yet.
+
+    Reconstructs an object equivalent to `filter_and_prepare`'s return value
+    (same signal, channel order, sampling rate, and annotations) directly
+    from the cache, so the caller can skip re-reading and re-filtering the
+    raw EDF entirely. A corrupt or incomplete cache entry is discarded so it
+    gets rebuilt rather than silently used.
+    """
+    array_path = directory / f"{recording_id}.npy"
+    channels_path = directory / f"{recording_id}_channels.json"
+    availability_path = directory / f"{recording_id}_channel_availability.json"
+    bte_side_path = directory / f"{recording_id}_bte_side.json"
+    annotations_path = directory / f"{recording_id}_annotations.json"
+    paths = (array_path, channels_path, availability_path, bte_side_path, annotations_path)
+
+    if not any(path.exists() for path in paths):
+        return None
+
+    try:
+        if not all(path.exists() for path in paths):
+            raise ValueError("one or more required cache files are missing")
+
+        signal = np.load(array_path)
+
+        with channels_path.open("r", encoding="utf-8") as channel_file:
+            channel_names = json.load(channel_file)
+        if channel_names != list(config.canonical_channel_names):
+            raise ValueError(f"unexpected channel layout {channel_names}")
+
+        if signal.ndim != 2 or signal.shape[0] != len(config.canonical_channel_names):
+            raise ValueError(f"unexpected signal shape {signal.shape}")
+        if signal.shape[1] <= 0:
+            raise ValueError("recording contains no samples")
+
+        with availability_path.open("r", encoding="utf-8") as availability_file:
+            availability = np.asarray(json.load(availability_file), dtype=bool)
+        if availability.shape != (len(config.canonical_channel_names),):
+            raise ValueError(f"invalid availability mask shape {availability.shape}")
+
+        with bte_side_path.open("r", encoding="utf-8") as bte_side_file:
+            bte_side = json.load(bte_side_file)
+
+        with annotations_path.open("r", encoding="utf-8") as annotations_file:
+            annotations_data = json.load(annotations_file)
+
+        raw = mne.io.RawArray(
+            signal,
+            mne.create_info(
+                channel_names,
+                sfreq=config.target_sfreq,
+                ch_types="eeg",
+            ),
+            verbose=False,
+        )
+        raw.set_annotations(
+            mne.Annotations(
+                onset=annotations_data["onset"],
+                duration=annotations_data["duration"],
+                description=annotations_data["description"],
+            )
+        )
+
+        return raw, bte_side, availability
+    except (ValueError, KeyError, json.JSONDecodeError, EOFError):
+        for path in paths:
+            path.unlink(missing_ok=True)
+        return None
+
+
 def load_channel_names_for_shard(
     array_path: Path,
 ) -> list[str]:
@@ -2035,7 +2154,12 @@ def write_standardized_shards(
     """
     Standardize every continuous recording and save its decision metadata.
 
-    Each recording belongs to exactly one patient-level split.
+    Each recording belongs to exactly one patient-level split. Each
+    recording's unscaled checkpoint under `unscaled_recordings_dir` is
+    deleted as soon as its standardized shard has been written, so peak
+    disk use does not require both copies of the full dataset at once.
+    A `--resume` build interrupted during this pass will need to refilter
+    whichever recordings had already been consumed here.
     """
     manifest_rows: list[dict[str, Any]] = []
 
@@ -2197,6 +2321,22 @@ def write_standardized_shards(
                     "channel_availability_path": str(availability_path),
                 }
             )
+
+        # This recording's full-resolution unscaled copy is never read again
+        # in this run. Its disk footprint can rival or exceed the processed
+        # shards being written here, so free it immediately rather than
+        # waiting for the whole build to finish -- otherwise both copies
+        # must coexist for the entire pass, roughly doubling peak disk use.
+        del X
+        for suffix in (
+            ".npy",
+            ".csv",
+            "_channels.json",
+            "_channel_availability.json",
+        ):
+            (
+                unscaled_recordings_dir / f"{recording_id}{suffix}"
+            ).unlink(missing_ok=True)
 
     return pd.DataFrame(manifest_rows)
 

@@ -14,6 +14,13 @@ By default sweeps window in {30, 15, 10} minutes x horizon in {2, 5, 10}
 minutes (9 combinations). Each combo's heavy interim/processed data is
 deleted immediately after that combo's training succeeds, keeping only its
 model checkpoint, metrics.json, and logs; pass --keep-data to retain it.
+
+The first combination's build_dataset.py run filters every raw EDF once
+and caches the result under data/seizeit2/interim/_shared/filtered_recordings
+(shared across combos, since filtering never depends on window/horizon).
+Every later combination reuses that cache instead of re-filtering, so only
+the first combo pays the full raw-EDF-processing cost. That shared cache
+is deleted at the end of the sweep unless --keep-data is passed.
 """
 
 from __future__ import annotations
@@ -35,7 +42,10 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.seizeit2.config import build_config  # noqa: E402
+from seizure_prediction.seizeit2.config import (  # noqa: E402
+    PreprocessingConfig,
+    build_config,
+)
 
 
 BUILD_SCRIPT = PROJECT_ROOT / "scripts" / "seizeit2" / "build_dataset.py"
@@ -147,24 +157,43 @@ def run_combination(
         f"{horizon_minutes:g}",
     ]
 
+    config = build_config(window_minutes, horizon_minutes)
+
     build_ok = run_stage(
-        [sys.executable, str(BUILD_SCRIPT), *sweep_flags],
+        [sys.executable, "-u", str(BUILD_SCRIPT), *sweep_flags],
         log_dir / f"{tag}_build.log",
     )
     if not build_ok:
-        return _failed_result(window_minutes, horizon_minutes, tag, "build_dataset failed")
+        return _failed_result(
+            window_minutes, horizon_minutes, tag, "build_dataset failed",
+            config, keep_data,
+        )
+
+    # The full-resolution unscaled recordings (unlike the raw dataset, every
+    # canonical channel is stored for every recording) can be far larger than
+    # the final processed shards -- e.g. ~120GB for all of SeizeIT2. Nothing
+    # downstream of a successful build reads them, so free this immediately
+    # rather than waiting for training to finish; otherwise one combo's peak
+    # usage can exhaust disk before the sweep ever gets a chance to clean up,
+    # starving every combination after it.
+    if not keep_data:
+        shutil.rmtree(config.unscaled_recordings_dir, ignore_errors=True)
 
     validate_ok = run_stage(
-        [sys.executable, str(VALIDATE_SCRIPT), *sweep_flags],
+        [sys.executable, "-u", str(VALIDATE_SCRIPT), *sweep_flags],
         log_dir / f"{tag}_validate.log",
     )
     if not validate_ok:
-        return _failed_result(window_minutes, horizon_minutes, tag, "validate_dataset failed")
+        return _failed_result(
+            window_minutes, horizon_minutes, tag, "validate_dataset failed",
+            config, keep_data,
+        )
 
     output_dir = sweep_dir / "models" / tag
     train_ok = run_stage(
         [
             sys.executable,
+            "-u",
             str(TRAIN_SCRIPT),
             *sweep_flags,
             "--output-dir",
@@ -174,13 +203,15 @@ def run_combination(
         log_dir / f"{tag}_train.log",
     )
     if not train_ok:
-        return _failed_result(window_minutes, horizon_minutes, tag, "train_eegnet_baseline failed")
+        return _failed_result(
+            window_minutes, horizon_minutes, tag, "train_eegnet_baseline failed",
+            config, keep_data,
+        )
 
     metrics_path = output_dir / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
 
     if not keep_data:
-        config = build_config(window_minutes, horizon_minutes)
         shutil.rmtree(config.interim_data_dir, ignore_errors=True)
         shutil.rmtree(config.processed_data_dir, ignore_errors=True)
 
@@ -200,9 +231,14 @@ def _failed_result(
     horizon_minutes: float,
     tag: str,
     reason: str,
+    config: PreprocessingConfig,
+    keep_data: bool,
 ) -> dict[str, object]:
-    """Build a failure row so one bad combination doesn't lose the others."""
+    """Build a failure row and reclaim that combo's disk so the next one isn't starved."""
     print(f"    FAILED: {reason}")
+    if not keep_data:
+        shutil.rmtree(config.interim_data_dir, ignore_errors=True)
+        shutil.rmtree(config.processed_data_dir, ignore_errors=True)
     return {
         "window_minutes": window_minutes,
         "horizon_minutes": horizon_minutes,
@@ -275,6 +311,8 @@ def main() -> None:
                 horizon_minutes,
                 f"w{int(round(window_minutes))}_h{int(round(horizon_minutes))}",
                 f"unexpected error: {error}",
+                build_config(window_minutes, horizon_minutes),
+                arguments.keep_data,
             )
         results.append(result)
 
@@ -283,6 +321,9 @@ def main() -> None:
             break
 
     results_path = write_results(results, sweep_dir)
+
+    if not arguments.keep_data:
+        shutil.rmtree(build_config().filtered_recordings_dir, ignore_errors=True)
 
     print(f"\nSweep results: {results_path}")
     for result in sorted(

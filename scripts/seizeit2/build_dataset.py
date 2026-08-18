@@ -10,6 +10,12 @@ window or prediction horizon; the output nests under a tagged
 subdirectory (e.g. data/seizeit2/processed/w30_h5/) so combinations can
 coexist. Never pass --resume across two different combinations — resumed
 checkpoints reuse a prior run's decision labels as-is.
+
+Filtering each raw EDF (bandpass, notch, channel canonicalization) never
+depends on the window/horizon configuration, so its output is cached once
+under data/seizeit2/interim/_shared/filtered_recordings and reused by every
+combination in a sweep — only the much cheaper decision-labeling, scaler,
+and shard-writing passes are repeated per combination.
 """
 
 from __future__ import annotations
@@ -46,10 +52,12 @@ from seizure_prediction.seizeit2.preprocessing import (  # noqa: E402
     fit_global_channel_scaler,
     infer_bte_side,
     load_bids_recordings,
+    load_filtered_recording_cache,
     patient_class_summary,
     read_seizure_events,
     read_recording_events,
     recording_id_from_entities,
+    save_filtered_recording_cache,
     save_scaler,
     save_unscaled_recording,
     seizure_scope_summary,
@@ -349,15 +357,33 @@ def main() -> None:
         )
         recording_events = read_recording_events(events_path)
 
-        raw = recording.load_raw()
-        bte_side = infer_bte_side(raw)
-        availability = channel_availability_mask(raw, config)
-
-        processed_raw = filter_and_prepare(
-            raw=raw,
-            config=config,
+        cached_filtered_recording = load_filtered_recording_cache(
+            recording_id,
+            config.filtered_recordings_dir,
+            config,
         )
-        del raw
+
+        if cached_filtered_recording is not None:
+            processed_raw, bte_side, availability = cached_filtered_recording
+            print("    Reused shared filtered-recording cache.")
+        else:
+            raw = recording.load_raw()
+            bte_side = infer_bte_side(raw)
+            availability = channel_availability_mask(raw, config)
+
+            processed_raw = filter_and_prepare(
+                raw=raw,
+                config=config,
+            )
+            del raw
+
+            save_filtered_recording_cache(
+                raw=processed_raw,
+                bte_side=bte_side,
+                channel_availability=availability,
+                output_directory=config.filtered_recordings_dir,
+                recording_id=recording_id,
+            )
 
         metadata_recording, seizure_metadata_recording = (
             create_labeled_prediction_decisions(
