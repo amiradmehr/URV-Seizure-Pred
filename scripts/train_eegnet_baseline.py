@@ -48,6 +48,8 @@ from seizure_prediction.datasets import (  # noqa: E402
     load_decision_examples,
 )
 from seizure_prediction.models import (  # noqa: E402
+    EEGNetAttentionConfig,
+    EEGNetAttentionRiskModel,
     EEGNetMeanPoolConfig,
     EEGNetMeanPoolRiskModel,
 )
@@ -81,6 +83,47 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Optional validation negatives per positive. Omit to evaluate all "
             "validation decisions; use a value only for faster development runs."
+        ),
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=("meanpool", "attention"),
+        default="meanpool",
+        help=(
+            "meanpool reproduces the original baseline. attention adds learned, "
+            "order-aware pooling over the 540 chunks plus a global-average-pool "
+            "encoder head."
+        ),
+    )
+    parser.add_argument(
+        "--attention-dim",
+        type=int,
+        default=64,
+        help="Hidden width of the attention scorer (attention architecture only).",
+    )
+    parser.add_argument(
+        "--keep-dense-head",
+        action="store_true",
+        help=(
+            "Keep EEGNet's flatten->Linear(640,32) head instead of average "
+            "pooling over time. That layer is 94%% of the baseline's parameters."
+        ),
+    )
+    parser.add_argument(
+        "--window-normalize",
+        action="store_true",
+        help=(
+            "Re-standardise each 45-minute history on its own median/IQR, on top "
+            "of the stored global z-score. Removes per-patient amplitude scale."
+        ),
+    )
+    parser.add_argument(
+        "--densify-positive-stride",
+        type=float,
+        default=None,
+        help=(
+            "Generate extra training positives between the existing 60 s ones, "
+            "e.g. 10 for a 6x larger positive class. Training split only."
         ),
     )
     parser.add_argument("--num-workers", type=int, default=0)
@@ -136,9 +179,12 @@ def build_loader(
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    window_normalize: bool = False,
 ) -> DataLoader:
     """Build a lazy loader over continuous recordings."""
-    dataset = StreamingDecisionDataset(examples, CONFIG)
+    dataset = StreamingDecisionDataset(
+        examples, CONFIG, window_normalize=window_normalize
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -286,6 +332,8 @@ def main() -> None:
         split="train",
         negative_to_positive_ratio=arguments.train_negative_ratio,
         seed=arguments.seed,
+        densify_positive_stride_seconds=arguments.densify_positive_stride,
+        config=CONFIG,
     )
     log("Loading validation decision metadata...")
     validation_examples = load_decision_examples(
@@ -301,6 +349,7 @@ def main() -> None:
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
+        window_normalize=arguments.window_normalize,
     )
     validation_loader = build_loader(
         validation_examples,
@@ -308,16 +357,37 @@ def main() -> None:
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
+        window_normalize=arguments.window_normalize,
     )
 
-    model_config = EEGNetMeanPoolConfig(
-        n_chans=len(CONFIG.canonical_channel_names),
-        chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
-        embedding_dim=arguments.embedding_dim,
-        encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
-        dropout=arguments.dropout,
+    if arguments.architecture == "attention":
+        model_config = EEGNetAttentionConfig(
+            n_chans=len(CONFIG.canonical_channel_names),
+            chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+            embedding_dim=arguments.embedding_dim,
+            encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
+            dropout=arguments.dropout,
+            attention_dim=arguments.attention_dim,
+            global_pool_head=not arguments.keep_dense_head,
+            n_chunks=int(
+                CONFIG.input_window_seconds / CONFIG.chunk_window_seconds
+            ),
+        )
+        model = EEGNetAttentionRiskModel(model_config).to(device)
+    else:
+        model_config = EEGNetMeanPoolConfig(
+            n_chans=len(CONFIG.canonical_channel_names),
+            chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+            embedding_dim=arguments.embedding_dim,
+            encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
+            dropout=arguments.dropout,
+        )
+        model = EEGNetMeanPoolRiskModel(model_config).to(device)
+    log(
+        f"Architecture: {arguments.architecture} | "
+        f"{sum(p.numel() for p in model.parameters()):,} parameters | "
+        f"window_normalize={arguments.window_normalize}"
     )
-    model = EEGNetMeanPoolRiskModel(model_config).to(device)
     optimizer = AdamW(
         model.parameters(),
         lr=arguments.learning_rate,
@@ -433,6 +503,8 @@ def main() -> None:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "architecture": arguments.architecture,
+                    "window_normalize": arguments.window_normalize,
                     "model_config": asdict(model_config),
                     "config": {
                         "target_sfreq": CONFIG.target_sfreq,

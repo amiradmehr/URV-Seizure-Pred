@@ -13,11 +13,80 @@ from torch.utils.data import Dataset
 from seizure_prediction.config import PreprocessingConfig
 
 
+def densify_positive_decisions(
+    examples: pd.DataFrame,
+    stride_seconds: float,
+    config: PreprocessingConfig,
+) -> pd.DataFrame:
+    """Add positive decisions between the existing ones, at a finer stride.
+
+    Only ~2,484 training positives exist because positives are generated on the
+    same 60-second grid as negatives, giving ``SOP / stride = 10`` decisions per
+    seizure. Interpolating that grid multiplies the positive class without
+    touching the negatives and without re-reading any annotation.
+
+    This is safe by construction rather than by re-checking. A target seizure is
+    only eligible when the full ``minimum_preseizure_clear_minutes`` (60 min)
+    before its onset is continuous clean EEG. For any decision time ``t`` lying
+    between two existing positives for that seizure, the 45-minute history
+    ``[t - H, t]`` is a subset of that already-verified clear interval, and the
+    recording-bounds check the original loop applied still holds because ``t``
+    never leaves the span of decisions that passed it.
+
+    The added windows overlap their neighbours by more than 98%, so they enlarge
+    the gradient signal far more than they enlarge the effective sample size.
+    """
+    positives = examples[examples["label"] == 1]
+    if positives.empty or "target_seizure_id" not in positives.columns:
+        return examples
+
+    stride_samples = int(round(stride_seconds * config.target_sfreq))
+    history_samples = int(round(config.input_window_seconds * config.target_sfreq))
+    if stride_samples <= 0:
+        raise ValueError("densify stride must be positive.")
+
+    generated: list[pd.DataFrame] = []
+    for _, seizure_rows in positives.groupby("target_seizure_id", sort=False):
+        ends = seizure_rows["decision_end_sample"].to_numpy(dtype=np.int64)
+        first_end, last_end = int(ends.min()), int(ends.max())
+        if last_end - first_end < stride_samples:
+            continue
+
+        template = seizure_rows.iloc[0]
+        existing = set(ends.tolist())
+        new_ends = [
+            end
+            for end in range(first_end, last_end + 1, stride_samples)
+            if end not in existing and end - history_samples >= 0
+        ]
+        if not new_ends:
+            continue
+
+        block = pd.DataFrame([template] * len(new_ends)).reset_index(drop=True)
+        block["decision_end_sample"] = new_ends
+        block["history_start_sample"] = [e - history_samples for e in new_ends]
+        block["decision_time_seconds"] = [e / config.target_sfreq for e in new_ends]
+        if "prediction_start_seconds" in block.columns:
+            block["prediction_start_seconds"] = block["decision_time_seconds"]
+        if "prediction_stop_seconds" in block.columns:
+            block["prediction_stop_seconds"] = block["decision_time_seconds"] + 60.0 * (
+                config.prediction_horizon_minutes
+                + config.seizure_occurrence_period_minutes
+            )
+        generated.append(block)
+
+    if not generated:
+        return examples
+    return pd.concat([examples, *generated], ignore_index=True)
+
+
 def load_decision_examples(
     processed_manifest_path: Path,
     split: str,
     negative_to_positive_ratio: float | None = None,
     seed: int = 0,
+    densify_positive_stride_seconds: float | None = None,
+    config: PreprocessingConfig | None = None,
 ) -> pd.DataFrame:
     """Load decision metadata for one split without loading EEG into memory.
 
@@ -77,6 +146,20 @@ def load_decision_examples(
             f"{sorted(missing_columns)}"
         )
 
+    if densify_positive_stride_seconds is not None:
+        if config is None:
+            raise ValueError("densify_positive_stride_seconds requires config.")
+        before = int((examples["label"] == 1).sum())
+        examples = densify_positive_decisions(
+            examples, densify_positive_stride_seconds, config
+        )
+        after = int((examples["label"] == 1).sum())
+        print(
+            f"Densified {split!r} positives {before:,} -> {after:,} "
+            f"at {densify_positive_stride_seconds:g}s stride",
+            flush=True,
+        )
+
     if negative_to_positive_ratio is not None:
         if negative_to_positive_ratio <= 0:
             raise ValueError("negative_to_positive_ratio must be positive.")
@@ -111,9 +194,17 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         self,
         examples: pd.DataFrame,
         config: PreprocessingConfig,
+        window_normalize: bool = False,
     ) -> None:
         self.examples = examples.reset_index(drop=True)
         self.config = config
+        # Re-standardise each 45-minute history on its own robust statistics.
+        # The stored shards carry a single global z-score fitted across all
+        # training patients, which leaves per-patient median sigma spanning ~26x
+        # -- absolute amplitude (impedance, electrode seating) rather than
+        # physiology, and the most likely thing the baseline fitted that could
+        # not transfer to unseen patients.
+        self.window_normalize = window_normalize
         self._signal_cache: dict[str, np.ndarray] = {}
         self._availability_cache: dict[str, np.ndarray] = {}
 
@@ -156,6 +247,32 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
             self._availability_cache[availability_path] = availability
         return self._availability_cache[availability_path]
 
+    def _normalize_window(
+        self,
+        history: np.ndarray,
+        availability: np.ndarray,
+    ) -> np.ndarray:
+        """Median/IQR-standardise each present channel over its own window.
+
+        Median and IQR rather than mean and standard deviation: EEG windows
+        carry movement and electrode artefacts whose amplitude dwarfs the
+        signal, and those would otherwise set the scale. Absent channels are
+        left at exactly zero, matching the stored convention.
+        """
+        present = availability > 0.5
+        if not present.any():
+            return history
+
+        quartiles = np.percentile(history[present], [25, 50, 75], axis=1)
+        median = quartiles[1][:, None]
+        spread = (quartiles[2] - quartiles[0])[:, None]
+        spread = np.maximum(spread, self.config.zscore_epsilon)
+
+        normalized = history.copy()
+        normalized[present] = (history[present] - median) / spread
+        normalized[~present] = 0.0
+        return normalized
+
     def __getitem__(
         self,
         index: int,
@@ -177,6 +294,12 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
             signal[:, history_start:decision_end],
             dtype=np.float32,
         )
+        if self.window_normalize:
+            history = self._normalize_window(
+                history,
+                self._load_availability(str(row["channel_availability_path"])),
+            )
+
         chunks = np.ascontiguousarray(
             history.reshape(
                 len(self.config.canonical_channel_names),

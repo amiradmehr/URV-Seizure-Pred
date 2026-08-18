@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from torch import nn
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     average_precision_score,
@@ -65,6 +66,8 @@ from seizure_prediction.datasets import (  # noqa: E402
     load_decision_examples,
 )
 from seizure_prediction.models import (  # noqa: E402
+    EEGNetAttentionConfig,
+    EEGNetAttentionRiskModel,
     EEGNetMeanPoolConfig,
     EEGNetMeanPoolRiskModel,
 )
@@ -137,15 +140,22 @@ def resolve_device(requested_device: str) -> torch.device:
 def load_model(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[EEGNetMeanPoolRiskModel, dict[str, Any]]:
-    """Rebuild the trained model exactly as it was checkpointed."""
+) -> tuple[nn.Module, dict[str, Any]]:
+    """Rebuild the trained model exactly as it was checkpointed.
+
+    Older checkpoints predate the architecture field and are always mean-pool.
+    """
     if not checkpoint_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}. Run training first."
         )
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model_config = EEGNetMeanPoolConfig(**checkpoint["model_config"])
+    architecture = checkpoint.get("architecture", "meanpool")
+    if architecture == "attention":
+        model_config = EEGNetAttentionConfig(**checkpoint["model_config"])
+    else:
+        model_config = EEGNetMeanPoolConfig(**checkpoint["model_config"])
 
     saved_config = checkpoint.get("config", {})
     expected_chunk_samples = int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq)
@@ -163,7 +173,10 @@ def load_model(
             "the current config defines."
         )
 
-    model = EEGNetMeanPoolRiskModel(model_config).to(device)
+    if architecture == "attention":
+        model = EEGNetAttentionRiskModel(model_config).to(device)
+    else:
+        model = EEGNetMeanPoolRiskModel(model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
@@ -171,15 +184,18 @@ def load_model(
 
 @torch.no_grad()
 def score_split(
-    model: EEGNetMeanPoolRiskModel,
+    model: nn.Module,
     examples: pd.DataFrame,
     device: torch.device,
     *,
     batch_size: int,
     num_workers: int,
+    window_normalize: bool = False,
 ) -> np.ndarray:
     """Return one seizure-risk probability per decision, in ``examples`` order."""
-    dataset = StreamingDecisionDataset(examples, CONFIG)
+    dataset = StreamingDecisionDataset(
+        examples, CONFIG, window_normalize=window_normalize
+    )
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -727,12 +743,18 @@ def main() -> None:
     if positive_count == 0 or negative_count == 0:
         raise ValueError(f"Split {arguments.split!r} does not contain both classes.")
 
+    window_normalize = bool(checkpoint.get("window_normalize", False))
+    log(
+        f"Architecture: {checkpoint.get('architecture', 'meanpool')} | "
+        f"window_normalize={window_normalize}"
+    )
     probabilities = score_split(
         model,
         examples,
         device,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
+        window_normalize=window_normalize,
     )
 
     predictions = examples.copy()
