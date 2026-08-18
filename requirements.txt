@@ -1,5 +1,6 @@
 # EEG and deep learning
 braindecode
+openneuro-py
 mne
 mne-bids
 edfio
