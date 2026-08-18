@@ -183,6 +183,48 @@ class PreprocessingConfig:
         )
 
     @property
+    def standardized_recordings_dir(self) -> Path:
+        """The one shared cache of every recording's standardized signal.
+
+        The standardized continuous signal for a recording depends only on
+        the filtered EEG and the fitted global scaler -- and
+        `fit_global_channel_scaler` fits that scaler from the (also
+        window/horizon-independent) filtered-recording cache rather than
+        from decision metadata -- so this never varies with window/horizon.
+        `write_standardized_shards` writes each recording here exactly
+        once, and every combination in a window/horizon sweep reuses it
+        instead of duplicating it under its own tagged `processed_data_dir`.
+        Deliberately NOT nested under `experiment_tag`, the same way
+        `filtered_recordings_dir` is shared, and for the same reason.
+
+        Like `filtered_recordings_dir`, this is a plain path-keyed cache,
+        not fingerprinted against the config that produced it: changing a
+        value it actually depends on (bandpass/notch/sampling settings,
+        `canonical_channel_names`, or the patient split) and rebuilding
+        without first clearing `data/seizeit2/interim/_shared/` will
+        silently reuse stale data, exactly as with `filtered_recordings_dir`
+        today.
+
+        Deliberately lives under `data/seizeit2/interim/_shared/` (like
+        `filtered_recordings_dir`) rather than under `data/seizeit2/
+        processed/`: build_dataset.py unconditionally
+        `shutil.rmtree`s the *untagged* `processed_data_dir` on every run
+        (default config, no --window-minutes/--horizon-minutes), which is
+        exactly `data/seizeit2/processed/` itself -- the same directory a
+        `processed/_shared/...` cache would live under. Nesting under
+        `interim/_shared` instead avoids that collision, since
+        build_dataset.py never wholesale-clears `interim_data_dir`.
+        """
+        return (
+            self.project_root
+            / "data"
+            / "seizeit2"
+            / "interim"
+            / "_shared"
+            / "standardized_recordings"
+        )
+
+    @property
     def manifests_dir(self) -> Path:
         """Metadata tables generated during preprocessing."""
         return self.interim_data_dir / "manifests"

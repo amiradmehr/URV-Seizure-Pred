@@ -14,17 +14,35 @@ from torch.utils.data import Dataset, Sampler
 from seizure_prediction.seizeit2.config import PreprocessingConfig
 
 
-def resolve_stored_path(path_value: str | Path) -> Path:
-    """Resolve manifest paths written on Windows when training inside WSL."""
+def resolve_stored_path(
+    path_value: str | Path,
+    project_root: Path | None = None,
+) -> Path:
+    """Resolve a manifest-stored path on the current machine.
+
+    Manifest paths are recorded relative to the project root that built
+    them (see `write_standardized_shards`), so the processed data tree can
+    be copied to another machine -- e.g. uploaded to Google Drive and
+    unzipped under a Colab clone of this repository -- and still resolve,
+    as long as the relative `data/...` layout is preserved. This also
+    resolves legacy manifests written with absolute Windows paths when
+    training inside WSL.
+    """
     path_text = str(path_value)
     native_path = Path(path_text)
-    if native_path.exists() or os.name == "nt":
+    if native_path.is_absolute():
+        if native_path.exists() or os.name == "nt":
+            return native_path
+
+        windows_path = PureWindowsPath(path_text)
+        if windows_path.drive:
+            drive_name = windows_path.drive.rstrip(":").lower()
+            return Path("/mnt") / drive_name / Path(*windows_path.parts[1:])
+
         return native_path
 
-    windows_path = PureWindowsPath(path_text)
-    if windows_path.drive:
-        drive_name = windows_path.drive.rstrip(":").lower()
-        return Path("/mnt") / drive_name / Path(*windows_path.parts[1:])
+    if project_root is not None:
+        return project_root / native_path
 
     return native_path
 
@@ -34,6 +52,7 @@ def load_decision_examples(
     split: str,
     negative_to_positive_ratio: float | None = None,
     seed: int = 0,
+    project_root: Path | None = None,
 ) -> pd.DataFrame:
     """Load decision metadata for one split without loading EEG into memory.
 
@@ -41,6 +60,10 @@ def load_decision_examples(
     are retained and a reproducible random subset of negatives is used. This
     controls the substantial class imbalance during baseline training while
     leaving the underlying processed recordings unchanged.
+
+    ``project_root`` resolves the manifest's relative shard paths (see
+    `resolve_stored_path`); pass `config.project_root` so this works
+    regardless of the current working directory.
     """
     manifest = pd.read_csv(processed_manifest_path, dtype={"subject": str})
     split_manifest = manifest[manifest["split"] == split]
@@ -69,12 +92,16 @@ def load_decision_examples(
     }
     for manifest_row in split_manifest.itertuples(index=False):
         metadata = pd.read_csv(
-            resolve_stored_path(manifest_row.metadata_path),
+            resolve_stored_path(manifest_row.metadata_path, project_root),
             dtype=metadata_dtypes,
         )
-        metadata["X_path"] = str(resolve_stored_path(manifest_row.X_path))
+        metadata["X_path"] = str(
+            resolve_stored_path(manifest_row.X_path, project_root)
+        )
         metadata["channel_availability_path"] = str(
-            resolve_stored_path(manifest_row.channel_availability_path)
+            resolve_stored_path(
+                manifest_row.channel_availability_path, project_root
+            )
         )
         frames.append(metadata)
 

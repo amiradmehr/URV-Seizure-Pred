@@ -383,6 +383,7 @@ def main() -> None:
                 channel_availability=availability,
                 output_directory=config.filtered_recordings_dir,
                 recording_id=recording_id,
+                output_dtype=config.signal_dtype,
             )
 
         metadata_recording, seizure_metadata_recording = (
@@ -555,10 +556,7 @@ def main() -> None:
     print_header("PASS 3: GLOBAL TRAIN-ONLY Z-SCORE FITTING")
 
     scaler = fit_global_channel_scaler(
-        metadata=window_metadata,
-        unscaled_recordings_dir=(
-            config.unscaled_recordings_dir
-        ),
+        filtered_recordings_dir=config.filtered_recordings_dir,
         epsilon=config.zscore_epsilon,
         config=config,
     )
@@ -595,6 +593,22 @@ def main() -> None:
 
     print_header("PASS 4: FINAL STANDARDIZED DATASET")
 
+    already_cached = (
+        config.standardized_recordings_dir.exists()
+        and any(config.standardized_recordings_dir.iterdir())
+    )
+    print(f"Standardized recordings:    {config.standardized_recordings_dir}")
+    print(
+        "  "
+        + (
+            "Reusing standardized recordings already cached by a prior "
+            "combination in this sweep where available; only recordings "
+            "not yet cached will be standardized now."
+            if already_cached
+            else "No existing cache yet; standardizing every recording now."
+        )
+    )
+
     processed_manifest = write_standardized_shards(
         metadata=window_metadata,
         unscaled_recordings_dir=(
@@ -605,6 +619,8 @@ def main() -> None:
         ),
         scaler=scaler,
         output_dtype=config.signal_dtype,
+        project_root=config.project_root,
+        standardized_recordings_dir=config.standardized_recordings_dir,
     )
 
     processed_manifest_path = (

@@ -1310,12 +1310,20 @@ def save_filtered_recording_cache(
     channel_availability: np.ndarray,
     output_directory: Path,
     recording_id: str,
+    output_dtype: str = "float32",
 ) -> None:
     """Cache one filtered recording so every window/horizon combo can reuse it.
 
     Filtering (bandpass, notch, channel canonicalization) never depends on
     the window/horizon configuration, so this cache is shared across every
     combination in a sweep instead of being recomputed for each one.
+
+    `raw.get_data()` returns MNE's internal float64 representation
+    regardless of the recording's original bit depth; it is downcast to
+    `output_dtype` (float32 everywhere else in this pipeline, including the
+    final standardized shards) before saving, halving this cache's disk
+    footprint with no precision loss beyond what standardization already
+    accepts.
     """
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -1325,7 +1333,7 @@ def save_filtered_recording_cache(
     bte_side_path = output_directory / f"{recording_id}_bte_side.json"
     annotations_path = output_directory / f"{recording_id}_annotations.json"
 
-    np.save(array_path, raw.get_data())
+    np.save(array_path, raw.get_data().astype(output_dtype, copy=False))
 
     with channels_path.open("w", encoding="utf-8") as channel_file:
         json.dump(list(raw.ch_names), channel_file, indent=2)
@@ -1991,54 +1999,55 @@ def apply_patient_channel_zscore(
 # ----------------------------------------------------------------------
 
 
+def subject_from_recording_id(recording_id: str) -> str:
+    """Extract the subject entity from a `sub-{subject}_...` recording ID."""
+    match = re.match(r"^sub-(?P<subject>[^_]+)", recording_id)
+    if match is None:
+        raise ValueError(f"Could not parse a subject from recording ID: {recording_id!r}")
+    return normalize_entity(match.group("subject"))
+
+
 def fit_global_channel_scaler(
-    metadata: pd.DataFrame,
-    unscaled_recordings_dir: Path,
+    filtered_recordings_dir: Path,
     epsilon: float,
     config: PreprocessingConfig,
 ) -> dict[str, Any]:
-    """Fit one per-channel z-score transform from training patients only."""
-    required_columns = {
-        "subject",
-        "recording_id",
-        "split",
-    }
-    missing_columns = required_columns - set(metadata.columns)
+    """Fit one per-channel z-score transform from training patients only.
 
-    if missing_columns:
+    Sourced from every recording in the shared `filtered_recordings_dir`
+    cache that belongs to a training subject -- NOT from decision metadata
+    -- so the fitted scaler depends only on filtering (bandpass, notch,
+    channel canonicalization) and the configured patient split, never on
+    window/horizon. A recording contributes here as long as it was
+    successfully filtered, regardless of whether any particular
+    window/horizon combination happens to retain a usable decision point
+    from it. This is what lets every combination in a window/horizon sweep
+    fit the exact same scaler and safely share one standardized-recording
+    cache (see `write_standardized_shards`) instead of each combination
+    needing its own.
+    """
+    array_paths = sorted(filtered_recordings_dir.glob("*.npy"))
+
+    if not array_paths:
         raise ValueError(
-            "Metadata is missing scaler columns: "
-            f"{sorted(missing_columns)}"
+            f"No filtered recordings found in {filtered_recordings_dir}."
         )
 
-    train_metadata = metadata[metadata["split"] == "train"]
-
-    if train_metadata.empty:
-        raise ValueError("There are no training decision points.")
-
-    observed_train_subjects = set(
-        train_metadata["subject"].map(normalize_entity)
-    )
-
-    if not observed_train_subjects.issubset(set(config.train_subjects)):
-        raise ValueError(
-            "Global scaler received non-training subjects: "
-            f"{sorted(observed_train_subjects - set(config.train_subjects))}"
-        )
-
+    train_subjects = set(config.train_subjects)
     channel_count = len(config.canonical_channel_names)
     signal_sum = np.zeros(channel_count, dtype=np.float64)
     signal_sum_squares = np.zeros(channel_count, dtype=np.float64)
     sample_count = np.zeros(channel_count, dtype=np.int64)
+    observed_train_subjects: set[str] = set()
 
-    for recording_id, recording_rows in train_metadata.groupby(
-        "recording_id",
-        sort=False,
-    ):
-        array_path = unscaled_recordings_dir / f"{recording_id}.npy"
+    for array_path in array_paths:
+        recording_id = array_path.stem
+        subject = subject_from_recording_id(recording_id)
 
-        if not array_path.exists():
-            raise FileNotFoundError(f"Missing unscaled recording: {array_path}")
+        if subject not in train_subjects:
+            continue
+
+        observed_train_subjects.add(subject)
 
         X = np.load(array_path, mmap_mode="r")
         channel_names = load_channel_names_for_shard(array_path)
@@ -2075,6 +2084,11 @@ def fit_global_channel_scaler(
             dtype=np.float64,
         ).sum(axis=1, dtype=np.float64)
         sample_count[present_channels] += selected.shape[1]
+
+    if not observed_train_subjects:
+        raise ValueError(
+            "No filtered recordings belong to a configured training subject."
+        )
 
     if np.any(sample_count <= 0):
         raise ValueError("At least one global scaler channel has no samples.")
@@ -2150,6 +2164,8 @@ def write_standardized_shards(
     processed_data_dir: Path,
     scaler: dict[str, Any],
     output_dtype: str,
+    project_root: Path,
+    standardized_recordings_dir: Path,
 ) -> pd.DataFrame:
     """
     Standardize every continuous recording and save its decision metadata.
@@ -2160,6 +2176,23 @@ def write_standardized_shards(
     disk use does not require both copies of the full dataset at once.
     A `--resume` build interrupted during this pass will need to refilter
     whichever recordings had already been consumed here.
+
+    The manifest records every shard path relative to `project_root`
+    (rather than absolute) so the processed data directory tree can be
+    copied to a different machine -- e.g. uploaded to Google Drive and
+    unzipped under a Colab clone of this repository -- and still resolve,
+    as long as scripts are run from the repository root as documented.
+
+    The standardized continuous signal for a recording depends only on the
+    filtered EEG and the fitted `scaler` -- never on the window/horizon
+    configuration, since `fit_global_channel_scaler` sources training
+    recordings from the filtered-recording cache rather than from decision
+    metadata -- so it is written once per recording into
+    `standardized_recordings_dir` and reused by every combination in a
+    sweep (they all fit the identical scaler) instead of duplicating that
+    far larger array under each combination's own `processed_data_dir`.
+    Only the small per-decision labels/metadata, which do depend on
+    window/horizon, are written per combination.
     """
     manifest_rows: list[dict[str, Any]] = []
 
@@ -2204,18 +2237,35 @@ def write_standardized_shards(
             if split_rows.empty:
                 continue
 
-            X_split_unscaled = np.asarray(
-                X,
-                dtype=np.float32,
+            standardized_recordings_dir.mkdir(
+                parents=True,
+                exist_ok=True,
             )
 
-            X_split = apply_global_channel_zscore(
-                X=X_split_unscaled,
-                channel_names=channel_names,
-                channel_availability=channel_availability,
-                scaler=scaler,
-                output_dtype=output_dtype,
+            X_path = (
+                standardized_recordings_dir
+                / f"{recording_id}_X.npy"
             )
+
+            if not X_path.exists():
+                X_split_unscaled = np.asarray(
+                    X,
+                    dtype=np.float32,
+                )
+
+                X_split = apply_global_channel_zscore(
+                    X=X_split_unscaled,
+                    channel_names=channel_names,
+                    channel_availability=channel_availability,
+                    scaler=scaler,
+                    output_dtype=output_dtype,
+                )
+
+                np.save(X_path, X_split)
+            # else: another combination in this sweep already produced the
+            # identical standardized signal for this recording (same scaler
+            # fingerprint) -- reuse it instead of recomputing and rewriting
+            # a multi-hundred-MB array.
 
             y_split = split_rows[
                 "label"
@@ -2246,11 +2296,6 @@ def write_standardized_shards(
                 exist_ok=True,
             )
 
-            X_path = (
-                split_directory
-                / f"{shard_name}_X.npy"
-            )
-
             y_path = (
                 split_directory
                 / f"{shard_name}_y.npy"
@@ -2270,7 +2315,6 @@ def write_standardized_shards(
                 / f"{shard_name}_channel_availability.json"
             )
 
-            np.save(X_path, X_split)
             np.save(y_path, y_split)
 
             split_rows.to_csv(
@@ -2310,15 +2354,17 @@ def write_standardized_shards(
                     "number_of_negative_decisions": int(
                         np.sum(y_split == 0)
                     ),
-                    "X_path": str(X_path),
-                    "y_path": str(y_path),
+                    "X_path": str(X_path.relative_to(project_root)),
+                    "y_path": str(y_path.relative_to(project_root)),
                     "metadata_path": str(
-                        metadata_path
+                        metadata_path.relative_to(project_root)
                     ),
                     "channels_path": str(
-                        channels_path
+                        channels_path.relative_to(project_root)
                     ),
-                    "channel_availability_path": str(availability_path),
+                    "channel_availability_path": str(
+                        availability_path.relative_to(project_root)
+                    ),
                 }
             )
 
