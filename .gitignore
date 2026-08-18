@@ -14,8 +14,16 @@ data/raw/
 data/interim/
 data/processed/
 
+# On Unity, data/ is a symlink into a /scratch workspace. Never commit it;
+# it would point at a path that does not exist on other machines.
+/data
+
 # Outputs
 outputs/
+
+# SLURM job logs and the submitting session's job-ID record
+logs/
+.pipeline_jobids
 
 # Local-only scripts and scratch work (not for the branch)
 local/
@@ -34,3 +42,6 @@ local/
 # Operating system
 .DS_Store
 Thumbs.db
+
+# Editor backups of job scripts
+slurm/*.bak

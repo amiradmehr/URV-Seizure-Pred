@@ -10,26 +10,32 @@ Everything downstream is driven by a single frozen config object; understand it 
 
 ## Commands
 
-Windows + PowerShell, using the checked-in `.venv`. Run all scripts from the repo root.
+Two supported environments. Run all scripts from the repo root.
+
+**Windows + PowerShell**, using the checked-in `.venv`:
 
 ```bash
 .venv\Scripts\python.exe -m pip install -e .
-```
-
-```bash
 .venv\Scripts\python.exe scripts\build_dataset.py
-```
-
-```bash
 .venv\Scripts\python.exe scripts\validate_dataset.py
+.venv\Scripts\python.exe scripts\train_eegnet_baseline.py --epochs 1
+.venv\Scripts\python.exe scripts\evaluate_model.py --split validation
 ```
 
+**UMass Unity (Linux + SLURM)** — see `slurm/README.md` for setup and resources:
+
 ```bash
-.venv\Scripts\python.exe scripts\train_eegnet_baseline.py --epochs 1
+sbatch slurm/00_download_data.sbatch     # 44 GiB EEG subset of ds005873
+sbatch slurm/10_build_dataset.sbatch     # add --resume to reuse checkpoints
+sbatch slurm/20_validate_dataset.sbatch
+sbatch slurm/30_train_eegnet.sbatch
+sbatch slurm/40_evaluate.sbatch          # --split test only when selection is final
 ```
+
+On Unity `data/` is a symlink into a `/scratch4` workspace; the pipeline writes ~330 GB, which does not fit in the group's `/work` allocation. Arguments after the sbatch script pass through to the underlying Python script.
 
 - `build_dataset.py --resume` reuses validated per-recording checkpoints in `data/interim/unscaled_recordings/` and only reprocesses missing/corrupt ones. A fresh run (no flag) wipes and rebuilds them.
-- The pipeline order is strict: **build → validate → train**. `train_eegnet_baseline.py` reads `data/interim/manifests/processed_shard_manifest.csv` and fails if it is missing.
+- The pipeline order is strict: **build → validate → train → evaluate**. `train_eegnet_baseline.py` reads `data/interim/manifests/processed_shard_manifest.csv` and fails if it is missing.
 - `--epochs 1` is the intended smoke test. Real runs default to 10 epochs; on CPU each epoch is slow because every decision expands to 540 chunks.
 - There is **no test suite** (`pytest` is installed but no tests exist). "Validation" here means dataset-integrity checks in `validate_dataset.py`, not unit tests.
 
@@ -41,6 +47,7 @@ Windows + PowerShell, using the checked-in `.venv`. Run all scripts from the rep
 - `data/interim/scaler_parameters/global_channel_zscore.json` — the one global z-score.
 - `data/processed/{train,validation,test}/` — final standardized shards, one set per recording (`_X.npy`, `_y.npy`, `_metadata.csv`, `_channels.json`, `_channel_availability.json`).
 - `outputs/models/eegnet_mean_pool/` — `best_model.pt` (selected on best validation **average precision**), `metrics.json`, `learning_curves.png`.
+- `outputs/evaluation/{validation,test}/` — `metrics.json`, `predictions.csv`, `operating_points.csv`, `per_patient_metrics.csv`, and the three result figures from `evaluate_model.py`.
 
 ## Architecture
 
@@ -58,6 +65,8 @@ Windows + PowerShell, using the checked-in `.venv`. Run all scripts from the rep
 **Eligibility & labeling.** A seizure is only a valid positive target if it has `minimum_preseizure_clear_minutes` (60 min) of continuous clean EEG before onset — no non-finite samples, no `bad*` annotations, no overlapping ictal/postictal window, and no non-background/non-seizure events (e.g. impedance checks). See `seizure_has_full_prediction_history` and `create_labeled_prediction_decisions`. Seizure **scope** (`local`/`cross`) is preserved only when the event file has a recognized scope column; otherwise it stays `unknown` and the build prints a warning. **The pipeline never invents scope labels** — do not add heuristic guesses.
 
 **Model (`models.py`).** `EEGNetMeanPoolRiskModel` encodes each 5 s chunk with Braindecode `EEGNet`, mean-pools the 540 chunk embeddings, concatenates the 3-value availability mask, and applies a linear head → one logit. It is deliberately a simple baseline; mean pooling is the intended first thing to replace with recurrent/attention temporal aggregation.
+
+**Evaluation (`evaluate_model.py`).** Training scores a *subsampled* validation split each epoch so model selection stays affordable; that AP is comparable across epochs but is not a reportable number. `evaluate_model.py` re-scores a split at true prevalence and reports two sensitivities: **decision-level** (per one-minute decision) and **seizure-level** (a seizure counts as caught if any decision in its pre-onset window alarms). False alarms are expressed per interictal hour — each negative decision stands for `input_stride_seconds` of interictal time. Seizure-level sensitivity under a fixed alarm budget is the number that matters clinically.
 
 ## Gotchas
 
