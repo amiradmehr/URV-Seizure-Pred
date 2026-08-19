@@ -47,7 +47,12 @@ about the same ~120GB total, once.
 Add --package to zip this data for upload to Google Drive: one small
 <tag>.zip per combination (labels, manifests, scaler) plus one
 shared_standardized_recordings.zip for the whole sweep, all under
-outputs/colab_packages/<sweep-name>/.
+outputs/colab_packages/<sweep-name>/. Each combination appends to that
+shared archive whatever recordings it standardized that are not in it
+yet, rather than the first combination writing it once and the rest
+skipping it -- a shorter window admits recordings a longer one was too
+long to use, so the archive is only complete once every combination has
+contributed. No recording is ever stored in it twice.
 
 Every path recorded in a combo's processed_shard_manifest.csv is relative
 to the repository root, so these zips can be unzipped directly into
@@ -225,15 +230,6 @@ def directory_size_bytes(directory: Path) -> int:
     return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
 
-def zip_directory(directory: Path, project_root: Path, archive_path: Path) -> None:
-    """Zip every file under `directory`, keeping paths relative to `project_root`."""
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for file_path in sorted(directory.rglob("*")):
-            if file_path.is_file():
-                archive.write(file_path, file_path.relative_to(project_root))
-
-
 def package_combo_manifest(config: PreprocessingConfig, package_dir: Path) -> Path:
     """Zip one combination's small, combo-specific data for upload.
 
@@ -265,27 +261,53 @@ def package_combo_manifest(config: PreprocessingConfig, package_dir: Path) -> Pa
 def package_shared_standardized_recordings(
     config: PreprocessingConfig,
     package_dir: Path,
-    already_packaged: list[bool],
 ) -> Path | None:
-    """Zip the shared standardized-recording cache, once for the whole sweep.
+    """Add whatever this combination contributed to the shared-cache archive.
 
     Every combination in a window/horizon sweep fits the identical scaler
     (see `fit_global_channel_scaler`) and therefore shares this exact cache,
-    so it only needs to be packaged once across the whole sweep -- not once
-    per combination -- to avoid re-uploading the same 100+GB of
-    standardized EEG for every combination. Returns None without doing
-    anything once already packaged earlier in the sweep (tracked via the
-    single-element `already_packaged` flag, mutated in place).
+    so any one recording only needs archiving once across the whole sweep --
+    not once per combination -- to avoid re-uploading the same 100+GB of
+    standardized EEG for every combination.
+
+    The cache is not complete after the first combination, though: a recording
+    is standardized only if it is long enough to yield at least one decision
+    for that combination's window and horizon, so a shorter window later in the
+    sweep standardizes recordings a longer earlier one had to skip. Packaging
+    only on the first combination froze the archive at the longest window's
+    recording set, leaving every shorter-window combination short the
+    recordings unique to it. Each combination therefore appends just the files
+    not already archived, so the finished archive covers all of them and no
+    recording is stored twice.
+
+    Returns the archive path if this call added anything, else None.
     """
-    if already_packaged[0]:
-        return None
-    already_packaged[0] = True
     archive_path = package_dir / "shared_standardized_recordings.zip"
-    zip_directory(
-        config.standardized_recordings_dir,
-        config.project_root,
+
+    already_archived: set[str] = set()
+    if archive_path.exists():
+        with zipfile.ZipFile(archive_path) as archive:
+            already_archived = set(archive.namelist())
+
+    # Zip members always use forward slashes, so compare against as_posix()
+    # rather than the platform-separated relative path.
+    new_files = [
+        file_path
+        for file_path in sorted(config.standardized_recordings_dir.rglob("*"))
+        if file_path.is_file()
+        and file_path.relative_to(config.project_root).as_posix() not in already_archived
+    ]
+    if not new_files:
+        return None
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(
         archive_path,
-    )
+        "a" if archive_path.exists() else "w",
+        zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for file_path in new_files:
+            archive.write(file_path, file_path.relative_to(config.project_root))
     return archive_path
 
 
@@ -319,7 +341,6 @@ def run_combination(
     keep_data: bool,
     preprocess_only: bool,
     package_dir: Path | None,
-    shared_data_packaged: list[bool],
 ) -> dict[str, object]:
     """Run build -> validate [-> train] for one combination and return its result."""
     tag = f"w{int(round(window_minutes))}_h{int(round(horizon_minutes))}"
@@ -391,18 +412,18 @@ def run_combination(
             print(f"    Packaged combo data: {combo_archive_path}")
 
             shared_archive_path = package_shared_standardized_recordings(
-                config, package_dir, shared_data_packaged
+                config, package_dir
             )
             if shared_archive_path is not None:
                 result["shared_package_path"] = str(shared_archive_path)
                 print(
-                    f"    Packaged shared standardized recordings: "
-                    f"{shared_archive_path}"
+                    f"    Added this combination's new standardized "
+                    f"recordings to: {shared_archive_path}"
                 )
             else:
                 print(
-                    "    Shared standardized recordings already packaged "
-                    "earlier in this sweep; skipped."
+                    "    This combination added no standardized recordings "
+                    "the shared archive did not already hold."
                 )
         # The whole point of --preprocess-only is to keep this combination's
         # processed data and manifests on disk for upload, so they are never
@@ -435,12 +456,12 @@ def run_combination(
         combo_archive_path = package_combo_manifest(config, package_dir)
         print(f"    Packaged combo data: {combo_archive_path}")
         shared_archive_path = package_shared_standardized_recordings(
-            config, package_dir, shared_data_packaged
+            config, package_dir
         )
         if shared_archive_path is not None:
             print(
-                f"    Packaged shared standardized recordings: "
-                f"{shared_archive_path}"
+                f"    Added this combination's new standardized "
+                f"recordings to: {shared_archive_path}"
             )
 
     if not keep_data:
@@ -542,7 +563,6 @@ def main() -> None:
         print(f"Packaging each combination's portable data into {package_dir}")
 
     results: list[dict[str, object]] = []
-    shared_data_packaged = [False]
     for window_minutes, horizon_minutes in combinations:
         try:
             result = run_combination(
@@ -553,7 +573,6 @@ def main() -> None:
                 arguments.keep_data,
                 arguments.preprocess_only,
                 package_dir,
-                shared_data_packaged,
             )
         except Exception as error:  # noqa: BLE001 - record and keep going
             result = _failed_result(
