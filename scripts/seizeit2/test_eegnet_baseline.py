@@ -55,11 +55,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import (
-    average_precision_score,
-    precision_recall_curve,
-    roc_auc_score,
-)
+from sklearn.metrics import precision_recall_curve, roc_curve
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -83,6 +79,7 @@ from seizure_prediction.models import (  # noqa: E402
     BaselineEEGNet,
     BaselineEEGNetConfig,
 )
+from seizure_prediction.metrics import summarize_binary_predictions  # noqa: E402
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -319,53 +316,19 @@ def summarize_predictions(
     probabilities: np.ndarray,
     mean_loss: float,
 ) -> dict[str, float | int]:
-    """Score pooled test predictions.
+    """Score pooled test predictions with the shared metric definitions.
 
-    Average precision is the primary number, chosen to match the metric
-    training selects on so test and validation AP can be read side by side.
-    Prevalence is reported alongside it because AP has no fixed baseline: a
-    useless model scores about the positive rate, so AP must be judged as a
-    lift over that, not against zero.
+    Delegates to `summarize_binary_predictions` -- the same function
+    `train_eegnet_baseline.py` scores validation with -- so every test number
+    means exactly what its validation counterpart means and the two are
+    directly comparable.
     """
-    positive_count = int((labels == 1).sum())
-    negative_count = int((labels == 0).sum())
-    prevalence = positive_count / len(labels)
-
-    average_precision = float(average_precision_score(labels, probabilities))
-    precision, recall, thresholds = precision_recall_curve(labels, probabilities)
-
-    # precision_recall_curve returns one more precision/recall point than
-    # thresholds; drop that trailing point so the arrays line up.
-    f1_scores = np.divide(
-        2 * precision[:-1] * recall[:-1],
-        precision[:-1] + recall[:-1],
-        out=np.zeros_like(precision[:-1]),
-        where=(precision[:-1] + recall[:-1]) > 0,
+    return summarize_binary_predictions(
+        labels,
+        probabilities,
+        mean_loss,
+        prefix="test_",
     )
-    best_index = int(np.argmax(f1_scores)) if len(f1_scores) else 0
-
-    return {
-        "test_decisions": int(len(labels)),
-        "test_positive_decisions": positive_count,
-        "test_negative_decisions": negative_count,
-        "test_prevalence": prevalence,
-        "test_loss": mean_loss,
-        "test_average_precision": average_precision,
-        "test_average_precision_lift_over_prevalence": (
-            average_precision / prevalence if prevalence > 0 else float("nan")
-        ),
-        "test_roc_auc": float(roc_auc_score(labels, probabilities)),
-        "test_best_f1": float(f1_scores[best_index]) if len(f1_scores) else 0.0,
-        "test_best_f1_threshold": (
-            float(thresholds[best_index]) if len(thresholds) else float("nan")
-        ),
-        "test_precision_at_best_f1": (
-            float(precision[best_index]) if len(f1_scores) else 0.0
-        ),
-        "test_recall_at_best_f1": (
-            float(recall[best_index]) if len(f1_scores) else 0.0
-        ),
-    }
 
 
 def save_test_summary(
@@ -375,32 +338,52 @@ def save_test_summary(
     experiment_tag: str,
     output_path: Path,
 ) -> None:
-    """Draw the test precision-recall curve against its prevalence baseline."""
+    """Draw the test precision-recall and ROC curves against their baselines."""
     precision, recall, _ = precision_recall_curve(labels, probabilities)
     prevalence = float(summary["test_prevalence"])
 
-    figure, axis = plt.subplots(figsize=(7, 5))
-    axis.plot(
+    figure, (pr_axis, roc_axis) = plt.subplots(1, 2, figsize=(13, 5))
+    pr_axis.plot(
         recall,
         precision,
         color="#2c7fb8",
         label=f"AP = {summary['test_average_precision']:.4f}",
     )
-    axis.axhline(
+    pr_axis.axhline(
         prevalence,
         color="#999999",
         linestyle="--",
         label=f"Prevalence baseline = {prevalence:.4f}",
     )
-    axis.set(
-        title=f"Held-out test precision-recall ({experiment_tag or 'baseline'})",
+    pr_axis.set(
+        title="Precision-recall",
         xlabel="Recall",
         ylabel="Precision",
         xlim=(0.0, 1.0),
         ylim=(0.0, 1.0),
     )
-    axis.grid(alpha=0.3)
-    axis.legend(loc="upper right")
+    pr_axis.grid(alpha=0.3)
+    pr_axis.legend(loc="upper right")
+
+    false_positive_rate, true_positive_rate, _ = roc_curve(labels, probabilities)
+    roc_axis.plot(
+        false_positive_rate,
+        true_positive_rate,
+        color="#2c7fb8",
+        label=f"AUC = {summary['test_roc_auc']:.4f}",
+    )
+    roc_axis.plot([0.0, 1.0], [0.0, 1.0], color="#999999", linestyle="--", label="Random (0.5)")
+    roc_axis.set(
+        title="ROC",
+        xlabel="False-positive rate",
+        ylabel="True-positive rate (recall)",
+        xlim=(0.0, 1.0),
+        ylim=(0.0, 1.0),
+    )
+    roc_axis.grid(alpha=0.3)
+    roc_axis.legend(loc="lower right")
+
+    figure.suptitle(f"Held-out test summary ({experiment_tag or 'baseline'})")
     figure.tight_layout()
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
@@ -564,9 +547,16 @@ def main() -> None:
           f"({summary['test_positive_decisions']}/{summary['test_decisions']} positive)")
     print(f"  lift over it: {summary['test_average_precision_lift_over_prevalence']:.2f}x")
     print(f"Test ROC AUC:   {summary['test_roc_auc']:.6f}")
+    print(f"Test Brier:     {summary['test_brier_score']:.6f} (lower is better)")
     print(f"Test loss:      {summary['test_loss']:.6f}")
     print(f"Best F1:        {summary['test_best_f1']:.6f} at threshold "
           f"{summary['test_best_f1_threshold']:.6f}")
+    print(f"  precision:    {summary['test_precision_at_best_f1']:.6f}")
+    print(f"  recall:       {summary['test_recall_at_best_f1']:.6f}")
+    print(f"  specificity:  {summary['test_specificity_at_best_f1']:.6f}")
+    print(f"  balanced acc: {summary['test_balanced_accuracy_at_best_f1']:.6f}")
+    print(f"Recall @ 5% FPR:  {summary['test_recall_at_5pct_false_positive_rate']:.6f}")
+    print(f"Recall @ 10% FPR: {summary['test_recall_at_10pct_false_positive_rate']:.6f}")
     validation_average_precision = checkpoint.get("best_validation_average_precision")
     if validation_average_precision is not None:
         print(

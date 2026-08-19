@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.patches import FancyBboxPatch
-from sklearn.metrics import average_precision_score, precision_recall_curve
+from sklearn.metrics import precision_recall_curve, roc_curve
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -61,16 +61,26 @@ from seizure_prediction.models import (  # noqa: E402
     BaselineEEGNet,
     BaselineEEGNetConfig,
 )
+from seizure_prediction.metrics import (  # noqa: E402
+    EPOCH_CURVE_METRICS,
+    summarize_binary_predictions,
+)
 
 
 @dataclass(frozen=True)
 class EvaluationResult:
-    """Minimal validation results plus values needed to draw the figures."""
+    """Validation results plus the raw scores needed to draw the figures.
+
+    `metrics` holds the full metric set from `summarize_binary_predictions`
+    (unprefixed keys); `average_precision` stays a named field because it is
+    the primary metric driving model selection and early stopping.
+    """
 
     loss: float
     average_precision: float
     labels: np.ndarray
     probabilities: np.ndarray
+    metrics: dict[str, float | int]
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -253,13 +263,19 @@ def evaluate(
     if total_examples == 0 or len(np.unique(label_values)) != 2:
         raise ValueError("Validation must contain examples from both classes.")
 
+    mean_loss = total_loss / total_examples
+    metrics = summarize_binary_predictions(
+        label_values,
+        probability_values,
+        mean_loss,
+    )
+
     return EvaluationResult(
-        loss=total_loss / total_examples,
-        average_precision=float(
-            average_precision_score(label_values, probability_values)
-        ),
+        loss=mean_loss,
+        average_precision=float(metrics["average_precision"]),
         labels=label_values,
         probabilities=probability_values,
+        metrics=metrics,
     )
 
 
@@ -269,9 +285,11 @@ def save_learning_curves(
     prevalence: float,
     output_path: Path,
 ) -> None:
-    """Plot the minimal training and validation metrics for this run."""
+    """Plot the training loss and every tracked validation metric per epoch."""
     epochs = [int(row["epoch"]) for row in history]
-    figure, (loss_axis, ap_axis) = plt.subplots(1, 2, figsize=(12, 5))
+    panel_count = 1 + len(EPOCH_CURVE_METRICS)
+    figure, axes = plt.subplots(1, panel_count, figsize=(6 * panel_count, 5))
+    loss_axis, metric_axes = axes[0], axes[1:]
 
     loss_axis.plot(
         epochs,
@@ -294,27 +312,38 @@ def save_learning_curves(
     loss_axis.grid(alpha=0.3)
     loss_axis.legend()
 
-    ap_axis.plot(
-        epochs,
-        [float(row["validation_average_precision"]) for row in history],
-        marker="o",
-        label="Validation average precision",
-    )
-    ap_axis.axhline(
-        prevalence,
-        color="black",
-        linestyle="--",
-        label=f"Random baseline ({prevalence:.4f})",
-    )
-    ap_axis.axvline(best_epoch, color="black", linestyle=":", label="Best epoch")
-    ap_axis.set(
-        title="Primary model-comparison metric",
-        xlabel="Epoch",
-        ylabel="Average precision (higher is better)",
-        ylim=(0.0, 1.0),
-    )
-    ap_axis.grid(alpha=0.3)
-    ap_axis.legend()
+    for axis, (metric_name, axis_label, y_limits) in zip(
+        metric_axes, EPOCH_CURVE_METRICS
+    ):
+        values = [float(row[f"validation_{metric_name}"]) for row in history]
+        axis.plot(epochs, values, marker="o", label=f"Validation {axis_label}")
+
+        # Average precision is the only one of these whose chance level depends
+        # on prevalence; ROC AUC and F1 would be misleading with that line.
+        if metric_name == "average_precision":
+            axis.axhline(
+                prevalence,
+                color="black",
+                linestyle="--",
+                label=f"Random baseline ({prevalence:.4f})",
+            )
+        elif metric_name == "roc_auc":
+            axis.axhline(0.5, color="black", linestyle="--", label="Random baseline (0.5)")
+
+        axis.axvline(best_epoch, color="black", linestyle=":", label="Best epoch")
+        title = (
+            "Primary model-comparison metric"
+            if metric_name == "average_precision"
+            else f"Secondary metric: {axis_label}"
+        )
+        axis.set(
+            title=title,
+            xlabel="Epoch",
+            ylabel=f"{axis_label} (higher is better)",
+            **({"ylim": y_limits} if y_limits else {}),
+        )
+        axis.grid(alpha=0.3)
+        axis.legend()
 
     figure.suptitle("Baseline EEGNet learning curves")
     figure.tight_layout()
@@ -416,7 +445,7 @@ def save_validation_summary(
     positive_scores = result.probabilities[result.labels == 1]
     negative_scores = result.probabilities[result.labels == 0]
 
-    figure, (pr_axis, score_axis) = plt.subplots(1, 2, figsize=(12, 5))
+    figure, (pr_axis, roc_axis, score_axis) = plt.subplots(1, 3, figsize=(18, 5))
     pr_axis.plot(
         recall,
         precision,
@@ -437,6 +466,26 @@ def save_validation_summary(
     )
     pr_axis.grid(alpha=0.3)
     pr_axis.legend()
+
+    false_positive_rate, true_positive_rate, _ = roc_curve(
+        result.labels,
+        result.probabilities,
+    )
+    roc_axis.plot(
+        false_positive_rate,
+        true_positive_rate,
+        label=f"EEGNet (AUC = {result.metrics['roc_auc']:.4f})",
+    )
+    roc_axis.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", label="Random (0.5)")
+    roc_axis.set(
+        title="ROC curve",
+        xlabel="False-positive rate",
+        ylabel="True-positive rate (recall)",
+        xlim=(0.0, 1.0),
+        ylim=(0.0, 1.0),
+    )
+    roc_axis.grid(alpha=0.3)
+    roc_axis.legend()
 
     maximum_score = max(0.05, float(np.max(result.probabilities)))
     bins = np.linspace(0.0, maximum_score, 51)
@@ -483,6 +532,19 @@ def save_metrics(
     best_average_precision: float,
 ) -> None:
     """Write one concise, machine-readable record of the baseline run."""
+    # Every metric from the selected epoch, promoted to the top level so
+    # comparing runs does not mean digging through `history` for the row whose
+    # epoch matches `best_epoch`.
+    best_epoch_metrics = next(
+        (row for row in history if int(row["epoch"]) == best_epoch),
+        {},
+    )
+    best_metrics = {
+        f"best_{name}": value
+        for name, value in best_epoch_metrics.items()
+        if name.startswith("validation_")
+    }
+
     output_path.write_text(
         json.dumps(
             {
@@ -492,6 +554,15 @@ def save_metrics(
                 "validation_metrics": [
                     "binary_cross_entropy",
                     "average_precision",
+                    "roc_auc",
+                    "brier_score",
+                    "best_f1",
+                    "precision_at_best_f1",
+                    "recall_at_best_f1",
+                    "specificity_at_best_f1",
+                    "balanced_accuracy_at_best_f1",
+                    "recall_at_5pct_false_positive_rate",
+                    "recall_at_10pct_false_positive_rate",
                 ],
                 "input_window_minutes": config.input_window_seconds / 60.0,
                 "seizure_occurrence_period_minutes": (
@@ -525,6 +596,7 @@ def save_metrics(
                 "history": history,
                 "best_epoch": best_epoch,
                 "best_validation_average_precision": best_average_precision,
+                **best_metrics,
             },
             indent=2,
         ),
@@ -701,10 +773,13 @@ def main() -> None:
         epoch_metrics: dict[str, float | int] = {
             "epoch": epoch,
             "train_loss": cumulative_train_loss / examples_seen,
-            "validation_loss": validation_result.loss,
-            "validation_average_precision": (
-                validation_result.average_precision
-            ),
+            # Every validation metric is recorded per epoch, not just the
+            # selection metric, so the learning curves and the final report can
+            # show how the others moved without a second evaluation pass.
+            **{
+                f"validation_{name}": value
+                for name, value in validation_result.metrics.items()
+            },
         }
         history.append(epoch_metrics)
         print(json.dumps(epoch_metrics, sort_keys=True))
@@ -776,7 +851,22 @@ def main() -> None:
         validation_summary_path,
     )
 
-    print(f"Best validation AP: {best_average_precision:.6f} at epoch {best_epoch}")
+    print(f"\nBest epoch {best_epoch} validation metrics:")
+    best_metrics = best_validation_result.metrics
+    print(f"  average precision:  {best_metrics['average_precision']:.6f} "
+          f"({best_metrics['average_precision_lift_over_prevalence']:.1f}x prevalence "
+          f"{best_metrics['prevalence']:.6f})")
+    print(f"  ROC AUC:            {best_metrics['roc_auc']:.6f}")
+    print(f"  Brier score:        {best_metrics['brier_score']:.6f} (lower is better)")
+    print(f"  best F1:            {best_metrics['best_f1']:.6f} "
+          f"at threshold {best_metrics['best_f1_threshold']:.6f}")
+    print(f"    precision:        {best_metrics['precision_at_best_f1']:.6f}")
+    print(f"    recall:           {best_metrics['recall_at_best_f1']:.6f}")
+    print(f"    specificity:      {best_metrics['specificity_at_best_f1']:.6f}")
+    print(f"    balanced acc.:    {best_metrics['balanced_accuracy_at_best_f1']:.6f}")
+    print(f"  recall @ 5% FPR:    {best_metrics['recall_at_5pct_false_positive_rate']:.6f}")
+    print(f"  recall @ 10% FPR:   {best_metrics['recall_at_10pct_false_positive_rate']:.6f}")
+    print()
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Metrics: {metrics_path}")
     print(f"Model overview: {model_overview_path}")
