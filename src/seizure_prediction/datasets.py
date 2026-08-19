@@ -27,8 +27,19 @@ def resolve_stored_path(
     as long as the relative `data/...` layout is preserved. This also
     resolves legacy manifests written with absolute Windows paths when
     training inside WSL.
+
+    A manifest built on Windows stores backslash-separated paths (e.g.
+    `data\\seizeit2\\processed\\w30_h2\\...`), since that's what
+    `Path.relative_to` / `str(Path)` produce there. `pathlib.Path` on Linux
+    never treats `\\` as a separator, so left as-is that whole string
+    becomes one path component with literal backslashes in the name --
+    never matching the real, correctly nested directories a zip extracts
+    into. Normalizing to `/` first fixes that; it's a no-op for paths that
+    are already POSIX-style, and forward slashes work equally well in a
+    Windows path, so nothing native to this project ever contains a
+    meaningful backslash for this replacement to corrupt.
     """
-    path_text = str(path_value)
+    path_text = str(path_value).replace("\\", "/")
     native_path = Path(path_text)
     if native_path.is_absolute():
         if native_path.exists() or os.name == "nt":
