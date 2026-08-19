@@ -157,9 +157,17 @@ class PreprocessingConfig:
         return base if self.experiment_tag is None else base / self.experiment_tag
 
     @property
-    def unscaled_recordings_dir(self) -> Path:
-        """Filtered continuous recordings before z-score standardization."""
-        return self.interim_data_dir / "unscaled_recordings"
+    def decision_checkpoints_dir(self) -> Path:
+        """Per-combination resumable decision-point checkpoints.
+
+        Holds only the small per-recording artifacts Pass 1 needs for
+        `--resume` support (decision metadata CSV, channel names, channel
+        availability) -- never the continuous EEG signal itself. That
+        signal is never duplicated per combination; Pass 4 reads it
+        straight from the shared `filtered_recordings_dir` cache instead
+        (see `write_standardized_shards`).
+        """
+        return self.interim_data_dir / "decision_checkpoints"
 
     @property
     def filtered_recordings_dir(self) -> Path:
@@ -356,7 +364,7 @@ class PreprocessingConfig:
         """Create all generated-data directories."""
         directories = [
             self.interim_data_dir,
-            self.unscaled_recordings_dir,
+            self.decision_checkpoints_dir,
             self.filtered_recordings_dir,
             self.manifests_dir,
             self.scaler_parameters_dir,

@@ -57,9 +57,9 @@ from seizure_prediction.seizeit2.preprocessing import (  # noqa: E402
     read_seizure_events,
     read_recording_events,
     recording_id_from_entities,
+    save_decision_checkpoint,
     save_filtered_recording_cache,
     save_scaler,
-    save_unscaled_recording,
     seizure_scope_summary,
     verify_patient_split_isolation,
     write_standardized_shards,
@@ -85,7 +85,7 @@ def parse_arguments() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help=(
-            "Reuse validated unscaled recording checkpoints and process only "
+            "Reuse validated decision checkpoints and process only "
             "missing or incomplete recordings. Never combine with a "
             "--window-minutes/--horizon-minutes value different from the "
             "run being resumed."
@@ -112,11 +112,16 @@ def parse_arguments() -> argparse.Namespace:
 def checkpoint_paths(
     recording_id: str,
     config: PreprocessingConfig,
-) -> tuple[Path, Path, Path, Path]:
-    """Return the four required unscaled-recording checkpoint paths."""
-    directory = config.unscaled_recordings_dir
+) -> tuple[Path, Path, Path]:
+    """Return the three required decision-checkpoint paths.
+
+    Unlike an earlier version of this pipeline, there is no signal `.npy`
+    checkpoint here -- the continuous EEG signal is never duplicated per
+    combination; it lives once in the shared `filtered_recordings_dir`
+    cache and `load_resumable_checkpoint` checks that directly instead.
+    """
+    directory = config.decision_checkpoints_dir
     return (
-        directory / f"{recording_id}.npy",
         directory / f"{recording_id}.csv",
         directory / f"{recording_id}_channels.json",
         directory / f"{recording_id}_channel_availability.json",
@@ -134,10 +139,10 @@ def load_resumable_checkpoint(
     config: PreprocessingConfig,
 ) -> pd.DataFrame | None:
     """Return validated saved decision metadata, or discard a bad checkpoint."""
-    array_path, metadata_path, channels_path, availability_path = checkpoint_paths(
+    metadata_path, channels_path, availability_path = checkpoint_paths(
         recording_id, config
     )
-    paths = (array_path, metadata_path, channels_path, availability_path)
+    paths = (metadata_path, channels_path, availability_path)
 
     if not any(path.exists() for path in paths):
         return None
@@ -146,14 +151,19 @@ def load_resumable_checkpoint(
         if not all(path.exists() for path in paths):
             raise ValueError("one or more required checkpoint files are missing")
 
-        signal = np.load(array_path, mmap_mode="r")
-        if signal.ndim != 2 or signal.shape[0] != len(config.canonical_channel_names):
-            raise ValueError(f"unexpected signal shape {signal.shape}")
-        if signal.shape[1] <= 0:
-            raise ValueError("recording contains no samples")
-        if not np.isfinite(signal[:, [0, -1]]).all():
-            raise ValueError("recording endpoint contains a non-finite value")
-        del signal
+        # The continuous signal itself is never duplicated per combination
+        # -- it lives once in the shared filtered-recording cache. A
+        # resumed decision checkpoint is only useful if that shared entry
+        # still exists; if it was never written or was cleaned up between
+        # runs, discard this checkpoint so Pass 1 regenerates it from a
+        # fresh filter/decision pass.
+        filtered_array_path = (
+            config.filtered_recordings_dir / f"{recording_id}.npy"
+        )
+        if not filtered_array_path.exists():
+            raise ValueError(
+                "shared filtered-recording cache is missing for this recording"
+            )
 
         with channels_path.open("r", encoding="utf-8") as channel_file:
             channel_names = json.load(channel_file)
@@ -198,7 +208,7 @@ def load_resumable_checkpoint(
     except OSError as error:
         raise RuntimeError(
             "Could not read an existing checkpoint; it was left untouched. "
-            f"Resolve the filesystem error and retry: {array_path} ({error})"
+            f"Resolve the filesystem error and retry: {metadata_path} ({error})"
         ) from error
 
 
@@ -246,10 +256,10 @@ def main() -> None:
     )
 
     if arguments.resume:
-        config.unscaled_recordings_dir.mkdir(parents=True, exist_ok=True)
+        config.decision_checkpoints_dir.mkdir(parents=True, exist_ok=True)
         print("Resume mode: validated existing recordings will be reused.")
     else:
-        clear_generated_directory(config.unscaled_recordings_dir)
+        clear_generated_directory(config.decision_checkpoints_dir)
 
     # Final shards and aggregate manifests are rebuilt from the complete
     # checkpoint set after pass 1, whether this is a fresh run or a resume.
@@ -426,16 +436,12 @@ def main() -> None:
             )
             continue
 
-        save_unscaled_recording(
-            signal=processed_raw.get_data().astype(
-                config.signal_dtype,
-                copy=False,
-            ),
+        save_decision_checkpoint(
             decision_metadata=metadata_recording,
             channel_names=processed_raw.ch_names,
             channel_availability=availability,
             output_directory=(
-                config.unscaled_recordings_dir
+                config.decision_checkpoints_dir
             ),
             recording_id=recording_id,
         )
@@ -611,8 +617,8 @@ def main() -> None:
 
     processed_manifest = write_standardized_shards(
         metadata=window_metadata,
-        unscaled_recordings_dir=(
-            config.unscaled_recordings_dir
+        filtered_recordings_dir=(
+            config.filtered_recordings_dir
         ),
         processed_data_dir=(
             config.processed_data_dir

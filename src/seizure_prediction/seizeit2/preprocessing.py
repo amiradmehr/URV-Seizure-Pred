@@ -1253,39 +1253,40 @@ def create_labeled_prediction_decisions(
 # ----------------------------------------------------------------------
 
 
-def save_unscaled_recording(
-    signal: np.ndarray,
+def save_decision_checkpoint(
     decision_metadata: pd.DataFrame,
     channel_names: list[str],
     channel_availability: np.ndarray,
     output_directory: Path,
     recording_id: str,
-) -> tuple[Path, Path]:
-    """Save one filtered continuous recording and its decision-time metadata."""
+) -> Path:
+    """Save one recording's decision-time metadata as a resumable checkpoint.
+
+    This deliberately does NOT duplicate the continuous EEG signal -- that
+    already lives once in the shared `filtered_recordings_dir` cache (see
+    `save_filtered_recording_cache`), and Pass 4 reads it from there
+    directly (see `write_standardized_shards`) instead of from a private
+    per-combination copy. Duplicating the full signal here, once per
+    window/horizon combination, was pure wasted disk and was the direct
+    cause of a sweep running out of disk space on the full dataset. Only
+    the small, genuinely combination-specific decision metadata is written
+    here.
+    """
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    array_path = output_directory / f"{recording_id}.npy"
     metadata_path = output_directory / f"{recording_id}.csv"
     channels_path = output_directory / f"{recording_id}_channels.json"
     availability_path = output_directory / f"{recording_id}_channel_availability.json"
 
-    if signal.ndim != 2:
-        raise ValueError(
-            "Continuous recording signal must have shape (channels, samples), "
-            f"found {signal.shape}."
-        )
-
     availability = np.asarray(channel_availability, dtype=bool)
-    if availability.shape != (signal.shape[0],):
+    if availability.shape != (len(channel_names),):
         raise ValueError(
-            "Channel availability must contain one value per signal channel; "
-            f"found shape {availability.shape} for {signal.shape[0]} channels."
+            "Channel availability must contain one value per channel; "
+            f"found shape {availability.shape} for {len(channel_names)} channels."
         )
 
     if not availability.any():
         raise ValueError("A recording must contain at least one available EEG channel.")
-
-    np.save(array_path, signal)
 
     decision_metadata.to_csv(
         metadata_path,
@@ -1301,7 +1302,7 @@ def save_unscaled_recording(
     with availability_path.open("w", encoding="utf-8") as availability_file:
         json.dump(availability.astype(int).tolist(), availability_file, indent=2)
 
-    return array_path, metadata_path
+    return metadata_path
 
 
 def save_filtered_recording_cache(
@@ -2160,7 +2161,7 @@ def apply_global_channel_zscore(
 
 def write_standardized_shards(
     metadata: pd.DataFrame,
-    unscaled_recordings_dir: Path,
+    filtered_recordings_dir: Path,
     processed_data_dir: Path,
     scaler: dict[str, Any],
     output_dtype: str,
@@ -2170,12 +2171,13 @@ def write_standardized_shards(
     """
     Standardize every continuous recording and save its decision metadata.
 
-    Each recording belongs to exactly one patient-level split. Each
-    recording's unscaled checkpoint under `unscaled_recordings_dir` is
-    deleted as soon as its standardized shard has been written, so peak
-    disk use does not require both copies of the full dataset at once.
-    A `--resume` build interrupted during this pass will need to refilter
-    whichever recordings had already been consumed here.
+    Each recording belongs to exactly one patient-level split. The
+    unscaled signal for each recording is read directly from the shared
+    `filtered_recordings_dir` cache -- the same cache every combination in
+    a window/horizon sweep reads from -- rather than from a private
+    per-combination copy, so it is never duplicated on disk and is never
+    deleted here (other combinations, and any later --resume build, still
+    need it).
 
     The manifest records every shard path relative to `project_root`
     (rather than absolute) so the processed data directory tree can be
@@ -2201,7 +2203,7 @@ def write_standardized_shards(
         sort=False,
     ):
         array_path = (
-            unscaled_recordings_dir
+            filtered_recordings_dir
             / f"{recording_id}.npy"
         )
 
@@ -2248,9 +2250,17 @@ def write_standardized_shards(
             )
 
             if not X_path.exists():
-                X_split_unscaled = np.asarray(
+                # np.array(..., copy=True) rather than np.asarray: when the
+                # on-disk dtype is already float32, np.asarray would hand
+                # back the same mmap-backed object instead of copying, and
+                # that lingering reference keeps the file mapped. On Windows
+                # (unlike POSIX) you cannot delete a file that is still
+                # memory-mapped, so the unscaled-recording cleanup below
+                # would fail with PermissionError: [WinError 32].
+                X_split_unscaled = np.array(
                     X,
                     dtype=np.float32,
+                    copy=True,
                 )
 
                 X_split = apply_global_channel_zscore(
@@ -2368,21 +2378,11 @@ def write_standardized_shards(
                 }
             )
 
-        # This recording's full-resolution unscaled copy is never read again
-        # in this run. Its disk footprint can rival or exceed the processed
-        # shards being written here, so free it immediately rather than
-        # waiting for the whole build to finish -- otherwise both copies
-        # must coexist for the entire pass, roughly doubling peak disk use.
+        # Release this recording's mmap'd view of the shared filtered-
+        # recording cache. Unlike the old per-combination copy, the
+        # underlying file is never deleted here -- it belongs to the
+        # shared cache and other combinations still need it.
         del X
-        for suffix in (
-            ".npy",
-            ".csv",
-            "_channels.json",
-            "_channel_availability.json",
-        ):
-            (
-                unscaled_recordings_dir / f"{recording_id}{suffix}"
-            ).unlink(missing_ok=True)
 
     return pd.DataFrame(manifest_rows)
 

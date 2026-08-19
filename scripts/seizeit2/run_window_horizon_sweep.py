@@ -347,16 +347,13 @@ def run_combination(
             config, keep_data,
         )
 
-    # The full-resolution unscaled recordings (unlike the raw dataset, every
-    # canonical channel is stored for every recording) can be far larger than
-    # the final processed shards -- e.g. ~120GB for all of SeizeIT2. Nothing
-    # downstream of a successful build reads them, so free this immediately
-    # rather than waiting for training to finish; otherwise one combo's peak
-    # usage can exhaust disk before the sweep ever gets a chance to clean up,
-    # starving every combination after it. This is never needed for training
-    # (on this machine or any other), so it is freed regardless of
-    # --keep-data/--preprocess-only.
-    shutil.rmtree(config.unscaled_recordings_dir, ignore_errors=True)
+    # Decision checkpoints are now tiny (per-recording CSV/JSON only -- the
+    # continuous EEG signal is never duplicated per combination; Pass 4
+    # reads it straight from the shared filtered-recording cache instead,
+    # see write_standardized_shards). Still tidied up immediately after a
+    # successful build so a stale checkpoint from an old run is never
+    # mistaken for this run's, regardless of --keep-data/--preprocess-only.
+    shutil.rmtree(config.decision_checkpoints_dir, ignore_errors=True)
 
     validate_ok = run_stage(
         [sys.executable, "-u", str(VALIDATE_SCRIPT), *sweep_flags],
