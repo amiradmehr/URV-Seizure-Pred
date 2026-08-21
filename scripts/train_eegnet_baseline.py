@@ -1,9 +1,10 @@
 r"""Train the single active EEGNet seizure-risk baseline.
 
 The model uses 45 minutes of EEG to predict seizure onset in the next
-10 minutes. Training sees every positive decision and a new 4:1 sample of
-negative decisions each epoch. Validation always uses the complete natural,
-patient-held-out validation split.
+10 minutes. The default training strategy sees every positive decision and a
+new 4:1 sample of negative decisions each epoch. An optional patient/event-
+balanced strategy changes exposure without changing the model. Validation
+always uses the complete natural, patient-held-out validation split.
 
 The deliberately minimal reporting protocol is:
 
@@ -51,6 +52,7 @@ if str(SRC_DIRECTORY) not in sys.path:
 from seizure_prediction.config import CONFIG  # noqa: E402
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
+    PatientEventBalancedEpochSampler,
     StreamingDecisionDataset,
     load_decision_examples,
 )
@@ -86,6 +88,24 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Training negatives sampled per positive each epoch. The default "
             "4:1 retains useful imbalance while giving positives enough signal."
+        ),
+    )
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=("decision-balanced", "patient-event-balanced"),
+        default="decision-balanced",
+        help=(
+            "Keep every positive decision, or cap events per patient and use "
+            "one rotating lead-time window per selected seizure."
+        ),
+    )
+    parser.add_argument(
+        "--max-events-per-patient",
+        type=int,
+        default=4,
+        help=(
+            "Maximum distinct seizures contributed by one patient per epoch "
+            "under patient-event-balanced sampling."
         ),
     )
     parser.add_argument(
@@ -127,6 +147,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         "encoder_chunk_batch_size",
         "gradient_accumulation_steps",
         "early_stopping_patience",
+        "max_events_per_patient",
     )
     for name in positive_integer_names:
         if getattr(arguments, name) <= 0:
@@ -488,6 +509,10 @@ def save_metrics(
                     ),
                     "embedding_dim": arguments.embedding_dim,
                     "seed": arguments.seed,
+                    "sampling_strategy": arguments.sampling_strategy,
+                    "max_events_per_patient": (
+                        arguments.max_events_per_patient
+                    ),
                 },
                 "history": history,
                 "best_epoch": best_epoch,
@@ -526,11 +551,19 @@ def main() -> None:
         negative_to_positive_ratio=None,
         seed=arguments.seed,
     )
-    train_sampler = BalancedEpochSampler(
-        train_examples["label"],
-        negative_to_positive_ratio=arguments.negative_to_positive_ratio,
-        seed=arguments.seed,
-    )
+    if arguments.sampling_strategy == "patient-event-balanced":
+        train_sampler = PatientEventBalancedEpochSampler(
+            train_examples,
+            negative_to_positive_ratio=arguments.negative_to_positive_ratio,
+            max_events_per_patient=arguments.max_events_per_patient,
+            seed=arguments.seed,
+        )
+    else:
+        train_sampler = BalancedEpochSampler(
+            train_examples["label"],
+            negative_to_positive_ratio=arguments.negative_to_positive_ratio,
+            seed=arguments.seed,
+        )
     train_loader = build_loader(
         train_examples,
         batch_size=arguments.batch_size,
@@ -550,7 +583,8 @@ def main() -> None:
     validation_positive_count = int((validation_examples["label"] == 1).sum())
     validation_negative_count = int((validation_examples["label"] == 0).sum())
     population_positive_fraction = train_positive_count / len(train_examples)
-    sampled_positive_fraction = train_positive_count / len(train_sampler)
+    sampled_positive_count = train_sampler.positive_count
+    sampled_positive_fraction = sampled_positive_count / len(train_sampler)
     logit_correction = sampling_prior_logit_correction(
         population_positive_fraction,
         sampled_positive_fraction,
@@ -585,12 +619,30 @@ def main() -> None:
         "all_training_decisions": len(train_examples),
         "training_positive_decisions": train_positive_count,
         "training_negative_decisions": train_negative_count,
+        "sampled_positive_decisions_per_epoch": sampled_positive_count,
         "training_decisions_per_epoch": len(train_sampler),
         "sampled_negatives_per_epoch": train_sampler.negative_count,
         "validation_decisions": len(validation_examples),
         "validation_positive_decisions": validation_positive_count,
         "validation_negative_decisions": validation_negative_count,
     }
+    if isinstance(train_sampler, PatientEventBalancedEpochSampler):
+        counts.update(
+            {
+                "available_training_seizures": (
+                    train_sampler.unique_seizure_count
+                ),
+                "positive_training_patients": (
+                    train_sampler.positive_patient_count
+                ),
+                "negative_training_patients": (
+                    train_sampler.negative_patient_count
+                ),
+                "max_events_per_patient_per_epoch": (
+                    train_sampler.max_events_per_patient
+                ),
+            }
+        )
     history: list[dict[str, float | int]] = []
     best_average_precision = float("-inf")
     best_epoch = 0
@@ -600,12 +652,22 @@ def main() -> None:
     print(json.dumps(counts, indent=2))
     print(
         "Starting protocol: "
+        f"sampling_strategy={arguments.sampling_strategy}, "
         f"negative:positive={arguments.negative_to_positive_ratio:g}:1, "
         f"learning_rate={arguments.learning_rate:g}, "
         f"dropout={arguments.dropout:g}, "
         f"effective_batch_size="
         f"{arguments.batch_size * arguments.gradient_accumulation_steps}."
     )
+    if isinstance(train_sampler, PatientEventBalancedEpochSampler):
+        print(
+            "Patient/event balance: "
+            f"{train_sampler.unique_seizure_count} available seizures across "
+            f"{train_sampler.positive_patient_count} positive patients; "
+            f"{train_sampler.positive_count} distinct seizure windows and "
+            f"{train_sampler.negative_count} patient-balanced negatives per "
+            "epoch."
+        )
     print(
         "Primary model-comparison metric: average precision on the full "
         "natural-prevalence validation split."

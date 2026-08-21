@@ -1,5 +1,6 @@
 # Virtual environments
 .venv/
+.venv-win/
 venv/
 .venv-old/
 venv-old/
@@ -9,10 +10,17 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
 # Raw and generated EEG data
 data/raw/
 data/interim/
 data/processed/
+data/embedding_cache/
+data/handcrafted_feature_cache/
 
 # Outputs
 outputs/
