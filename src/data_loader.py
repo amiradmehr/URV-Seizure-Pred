@@ -1,1 +1,0 @@
-# Braindecode/MNE scripts to read EDF files

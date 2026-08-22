@@ -1,13 +1,38 @@
-# Virtual environment
+# Virtual environments
 .venv/
-
-# Data
-data/
+.venv-win/
+venv/
+.venv-old/
+venv-old/
 
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
+.pytest_cache/
 
-# OS
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Raw and generated EEG data
+data/raw/
+data/interim/
+data/processed/
+data/embedding_cache/
+data/handcrafted_feature_cache/
+
+# Outputs
+outputs/
+
+# Large arrays
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
 .DS_Store
+Thumbs.db
