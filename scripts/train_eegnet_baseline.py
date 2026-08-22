@@ -463,6 +463,36 @@ def save_validation_summary(
     plt.close(figure)
 
 
+def processed_normalization() -> dict[str, object]:
+    """Describe how data/processed was standardized when this run started.
+
+    Two runs that differ only in normalization scope are otherwise identical
+    inside metrics.json, so recording it here is what makes them comparable
+    later. Missing state means the original global build, which predates the
+    marker file.
+    """
+    state_path = CONFIG.processed_data_dir / "normalization_state.json"
+    if not state_path.exists():
+        return {
+            "normalization_mode": "global",
+            "statistic": "meanstd",
+            "source": "assumed; no normalization_state.json present",
+        }
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("in_progress", False):
+        raise RuntimeError(
+            f"{state_path} reports an unfinished re-standardization. "
+            "data/processed is in a mixed state; rerun "
+            "scripts/restandardize_processed.py before training."
+        )
+    return {
+        "normalization_mode": state.get("normalization_mode"),
+        "statistic": state.get("statistic"),
+        "converted_recordings": len(state.get("converted_recordings", [])),
+        "source": str(state_path),
+    }
+
+
 def save_metrics(
     *,
     output_path: Path,
@@ -480,6 +510,7 @@ def save_metrics(
         json.dumps(
             {
                 "model": "BaselineEEGNet",
+                "input_normalization": processed_normalization(),
                 "primary_comparison_metric": "validation_average_precision",
                 "training_metric": "binary_cross_entropy",
                 "validation_metrics": [
@@ -531,6 +562,10 @@ def main() -> None:
     CONFIG.validate()
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
+
+    # Checked before loading data so an interrupted re-standardization fails
+    # here rather than after a full training run.
+    normalization = processed_normalization()
 
     manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
@@ -649,6 +684,11 @@ def main() -> None:
     epochs_without_improvement = 0
 
     print(f"Device: {device}")
+    print(
+        "Input normalization: "
+        f"mode={normalization['normalization_mode']}, "
+        f"statistic={normalization['statistic']}"
+    )
     print(json.dumps(counts, indent=2))
     print(
         "Starting protocol: "

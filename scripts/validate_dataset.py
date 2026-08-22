@@ -24,6 +24,10 @@ if str(SRC_DIRECTORY) not in sys.path:
 
 
 from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.normalization import (  # noqa: E402
+    load_scaler_document,
+    scaler_key_for,
+)
 from seizure_prediction.preprocessing import (  # noqa: E402
     verify_patient_split_isolation,
 )
@@ -553,35 +557,77 @@ def validate_training_standardization(
 
 
 def validate_global_scaler() -> None:
-    """Confirm the saved global scaler was fit from training patients only."""
-    scaler_path = (
-        CONFIG.scaler_parameters_dir
-        / "global_channel_zscore.json"
+    """Confirm the saved scalers match the configured normalization scope.
+
+    Only ``global`` mode carries a train/validation/test asymmetry, so only
+    that mode is checked for held-out subjects. ``patient`` and ``recording``
+    scalers are fitted from the data they normalize by design; they are checked
+    instead for complete coverage of the processed dataset.
+    """
+    document_path = CONFIG.scaler_parameters_dir / "channel_scalers.json"
+    legacy_path = CONFIG.scaler_parameters_dir / "global_channel_zscore.json"
+
+    if document_path.exists():
+        scaler_path = document_path
+    elif legacy_path.exists():
+        scaler_path = legacy_path
+    else:
+        raise FileNotFoundError(
+            f"No scaler document found at {document_path} or {legacy_path}"
+        )
+
+    document = load_scaler_document(scaler_path)
+    mode = document["normalization_mode"]
+
+    if document.get("channel_names") != list(CONFIG.canonical_channel_names):
+        raise ValueError(
+            "Scaler channel layout does not match the configured canonical "
+            "layout."
+        )
+
+    print(
+        f"Normalization: mode={mode}, "
+        f"statistic={document.get('statistic', 'meanstd')}, "
+        f"scalers={document.get('scaler_count', len(document['scalers']))}"
     )
 
-    if not scaler_path.exists():
-        raise FileNotFoundError(
-            f"Global scaler not found: {scaler_path}"
+    if mode == "global":
+        scaler_subjects = set(map(str, document.get("training_subjects", [])))
+
+        if not scaler_subjects:
+            raise ValueError("Global scaler records no training subjects.")
+
+        if not scaler_subjects.issubset(set(CONFIG.train_subjects)):
+            raise ValueError(
+                "Global scaler includes validation/test subjects: "
+                f"{sorted(scaler_subjects - set(CONFIG.train_subjects))}"
+            )
+        return
+
+    # Per-patient and per-recording scaling must cover every processed shard,
+    # otherwise some recording would be standardized by another group's stats.
+    manifest = load_processed_manifest()
+    required_keys = {
+        scaler_key_for(
+            mode,
+            subject=str(row.subject).zfill(3),
+            recording_id=str(row.recording_id),
+        )
+        for row in manifest.itertuples(index=False)
+    }
+    uncovered = sorted(required_keys - set(document["scalers"]))
+
+    if uncovered:
+        raise ValueError(
+            f"{len(uncovered)} processed recording(s) have no {mode} scaler, "
+            f"first: {uncovered[:5]}"
         )
 
-    with scaler_path.open("r", encoding="utf-8") as scaler_file:
-        scaler = json.load(scaler_file)
-
-    if scaler.get("channel_names") != list(CONFIG.canonical_channel_names):
-        raise ValueError(
-            "Global scaler channel layout does not match the configured "
-            "canonical layout."
-        )
-
-    scaler_subjects = set(map(str, scaler.get("training_subjects", [])))
-
-    if not scaler_subjects:
-        raise ValueError("Global scaler records no training subjects.")
-
-    if not scaler_subjects.issubset(set(CONFIG.train_subjects)):
-        raise ValueError(
-            "Global scaler includes validation/test subjects: "
-            f"{sorted(scaler_subjects - set(CONFIG.train_subjects))}"
+    if document.get("non_causal_statistics"):
+        print(
+            "  Note: these statistics summarize whole recordings and are "
+            "therefore non-causal. No labels were used and nothing crosses "
+            "between patients."
         )
 
 

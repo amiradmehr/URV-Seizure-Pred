@@ -26,6 +26,14 @@ if str(SRC_DIRECTORY) not in sys.path:
 
 
 from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.normalization import (  # noqa: E402
+    NORMALIZATION_MODES,
+    STATISTICS,
+    build_scaler_document,
+    fit_channel_scaler,
+    save_scaler_document,
+    scaler_key_for,
+)
 from seizure_prediction.preprocessing import (  # noqa: E402
     assign_patient_splits,
     channel_availability_mask,
@@ -34,14 +42,13 @@ from seizure_prediction.preprocessing import (  # noqa: E402
     extract_recording_entities,
     filter_and_prepare,
     find_events_file,
-    fit_global_channel_scaler,
     infer_bte_side,
     load_bids_recordings,
     patient_class_summary,
     read_seizure_events,
     read_recording_events,
     recording_id_from_entities,
-    save_scaler,
+    normalize_entity,
     save_unscaled_recording,
     seizure_scope_summary,
     verify_patient_split_isolation,
@@ -70,6 +77,27 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Reuse validated unscaled recording checkpoints and process only "
             "missing or incomplete recordings."
+        ),
+    )
+    parser.add_argument(
+        "--normalization",
+        choices=NORMALIZATION_MODES,
+        default="patient",
+        help=(
+            "Scope of the channel z-score. 'patient' gives every patient their "
+            "own center/scale, which stops between-patient amplitude "
+            "differences from dominating the input. 'global' reproduces the "
+            "original single train-fitted transform."
+        ),
+    )
+    parser.add_argument(
+        "--statistic",
+        choices=STATISTICS,
+        default="meanstd",
+        help=(
+            "meanstd is the classic z-score. robust uses median/IQR, which "
+            "resists the movement and electrode-pop artifacts common in "
+            "wearable EEG."
         ),
     )
     return parser.parse_args()
@@ -186,6 +214,99 @@ def seizure_metadata_from_resumed_checkpoint(
     ] = True
     resumed_seizures["eligibility_evaluated"] = False
     return resumed_seizures
+
+
+def fit_scalers_for_build(
+    metadata: pd.DataFrame,
+    mode: str,
+    statistic: str,
+) -> dict:
+    """Fit every scaler the requested normalization mode needs.
+
+    ``global`` fits one transform from training patients only, preserving the
+    original train/validation/test asymmetry. ``patient`` and ``recording`` fit
+    each group from its own recordings, so validation and test patients are
+    normalized by their own statistics and never by another patient's.
+    """
+    recordings = (
+        metadata[["subject", "recording_id", "split"]]
+        .drop_duplicates(subset="recording_id")
+        .copy()
+    )
+    recordings["subject"] = recordings["subject"].map(normalize_entity)
+
+    if mode == "global":
+        contributing = recordings[recordings["split"] == "train"]
+        if contributing.empty:
+            raise ValueError("There are no training recordings to fit a scaler.")
+    else:
+        contributing = recordings
+
+    availability_by_path: dict[Path, np.ndarray] = {}
+    for recording_id in contributing["recording_id"]:
+        array_path, _, _, availability_path = checkpoint_paths(str(recording_id))
+        with availability_path.open("r", encoding="utf-8") as availability_file:
+            availability_by_path[array_path] = np.asarray(
+                json.load(availability_file),
+                dtype=bool,
+            )
+
+    contributing = contributing.assign(
+        scaler_key=[
+            scaler_key_for(
+                mode,
+                subject=row.subject,
+                recording_id=row.recording_id,
+            )
+            for row in contributing.itertuples(index=False)
+        ]
+    )
+
+    scalers: dict[str, dict] = {}
+    groups = list(contributing.groupby("scaler_key", sort=True))
+    for group_number, (scaler_key, group) in enumerate(groups, start=1):
+        array_paths = [
+            checkpoint_paths(str(recording_id))[0]
+            for recording_id in group["recording_id"]
+        ]
+        scalers[scaler_key] = fit_channel_scaler(
+            array_paths,
+            availability_by_path,
+            channel_names=list(CONFIG.canonical_channel_names),
+            statistic=statistic,
+            epsilon=CONFIG.zscore_epsilon,
+        )
+        print(
+            f"[{group_number:04d}/{len(groups):04d}] {scaler_key}: "
+            f"{len(array_paths)} recording(s)"
+        )
+
+    if mode != "global":
+        # Every recording must be covered, including validation and test.
+        missing = [
+            scaler_key_for(
+                mode,
+                subject=row.subject,
+                recording_id=row.recording_id,
+            )
+            for row in recordings.itertuples(index=False)
+        ]
+        uncovered = sorted(set(missing) - set(scalers))
+        if uncovered:
+            raise ValueError(
+                f"No {mode} scaler was fitted for: {uncovered[:5]}"
+            )
+
+    return build_scaler_document(
+        mode=mode,
+        statistic=statistic,
+        channel_names=list(CONFIG.canonical_channel_names),
+        scalers=scalers,
+        epsilon=CONFIG.zscore_epsilon,
+        training_subjects=(
+            sorted(set(contributing["subject"])) if mode == "global" else None
+        ),
+    )
 
 
 def main() -> None:
@@ -491,18 +612,18 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Pass 3: Fit a global channel z-score using training patients only.
+    # Pass 3: Fit the channel scalers at the requested scope.
     # ------------------------------------------------------------------
 
-    print_header("PASS 3: GLOBAL TRAIN-ONLY Z-SCORE FITTING")
+    print_header(
+        f"PASS 3: {arguments.normalization.upper()} "
+        f"{arguments.statistic.upper()} SCALER FITTING"
+    )
 
-    scaler = fit_global_channel_scaler(
+    scaler_document = fit_scalers_for_build(
         metadata=window_metadata,
-        unscaled_recordings_dir=(
-            CONFIG.unscaled_recordings_dir
-        ),
-        epsilon=CONFIG.zscore_epsilon,
-        config=CONFIG,
+        mode=arguments.normalization,
+        statistic=arguments.statistic,
     )
 
     patient_summary = patient_class_summary(window_metadata)
@@ -517,18 +638,23 @@ def main() -> None:
 
     scaler_path = (
         CONFIG.scaler_parameters_dir
-        / "global_channel_zscore.json"
+        / "channel_scalers.json"
     )
 
-    save_scaler(
-        scaler=scaler,
-        output_path=scaler_path,
-    )
+    save_scaler_document(scaler_document, scaler_path)
 
     print(
-        "Fitted one global scaler using "
-        f"{len(scaler['training_subjects'])} training patients."
+        f"\nFitted {scaler_document['scaler_count']} "
+        f"{arguments.normalization} scaler(s) "
+        f"({arguments.statistic}) over "
+        f"{scaler_document['fitted_on']}."
     )
+    if scaler_document["non_causal_statistics"]:
+        print(
+            "Note: these statistics summarize whole recordings, so the "
+            "scaling of an early decision reflects later samples. A deployed "
+            "system would calibrate on a prefix instead."
+        )
     print(f"Scaler file: {scaler_path}")
 
     # ------------------------------------------------------------------
@@ -545,7 +671,7 @@ def main() -> None:
         processed_data_dir=(
             CONFIG.processed_data_dir
         ),
-        scaler=scaler,
+        scaler_document=scaler_document,
         output_dtype=CONFIG.signal_dtype,
     )
 

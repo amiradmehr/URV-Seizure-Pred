@@ -71,6 +71,25 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max-events-per-patient", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--subjects",
+        nargs="*",
+        default=(),
+        help=(
+            "Restrict caching to these subjects. Without it every "
+            "recording in the selected splits is processed."
+        ),
+    )
+    parser.add_argument(
+        "--complete-subjects",
+        nargs="*",
+        default=(),
+        help=(
+            "Cache every minute of these subjects' recordings instead of "
+            "only the sampler-selected histories. Required for per-patient "
+            "analyses that use all of a patient's decisions."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -181,9 +200,19 @@ def run_cache_job(job: dict[str, object]) -> tuple[int, bool]:
 def required_minute_coverage(
     examples: pd.DataFrame,
     manifest: pd.DataFrame,
+    complete_subjects: set[str] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Return exact whole-minute coverage needed by the selected decisions."""
+    """Return exact whole-minute coverage needed by the selected decisions.
+
+    ``complete_subjects`` forces every minute of a subject's recordings to be
+    cached, rather than only the minutes the balanced sampler happened to
+    select. Per-patient analyses such as leave-one-recording-out need all of a
+    patient's decisions, not a training subsample.
+    """
     samples_per_minute = int(round(CONFIG.target_sfreq * 60.0))
+    complete_subjects = {
+        str(subject).zfill(3) for subject in (complete_subjects or set())
+    }
     signal_minutes = {
         str(resolve_stored_path(row.X_path)): (
             np.load(resolve_stored_path(row.X_path), mmap_mode="r").shape[1]
@@ -201,6 +230,14 @@ def required_minute_coverage(
         if path not in coverage or stop - start != 45:
             raise ValueError("Selected decision does not match a cache recording/history.")
         coverage[path][start:stop] = True
+
+    if complete_subjects:
+        for row in manifest.itertuples(index=False):
+            if str(row.subject).zfill(3) not in complete_subjects:
+                continue
+            path = str(resolve_stored_path(row.X_path))
+            coverage[path][:] = True
+
     return coverage
 
 
@@ -262,7 +299,28 @@ def main() -> None:
             )
         )
     selected = pd.concat(selected_examples, ignore_index=True)
-    coverage_by_path = required_minute_coverage(selected, recordings)
+    if arguments.subjects:
+        wanted = {str(subject).zfill(3) for subject in arguments.subjects}
+        recordings = recordings[
+            recordings["subject"].astype(str).str.zfill(3).isin(wanted)
+        ].reset_index(drop=True)
+        selected = selected[
+            selected["subject"].astype(str).str.zfill(3).isin(wanted)
+        ]
+        if recordings.empty:
+            raise ValueError(f"No recordings match subjects {sorted(wanted)}.")
+        print(f"Restricted to {len(wanted)} subject(s), "
+              f"{len(recordings)} recording(s).")
+    coverage_by_path = required_minute_coverage(
+        selected,
+        recordings,
+        complete_subjects=set(arguments.complete_subjects),
+    )
+    if arguments.complete_subjects:
+        print(
+            f"Complete coverage requested for "
+            f"{len(set(arguments.complete_subjects))} subject(s)."
+        )
     total_minutes = 0
     verified = 0
     print(f"Recordings to cache: {len(recordings):,}")
@@ -320,6 +378,10 @@ def main() -> None:
         "missing_channels_zeroed": True,
     }
     arguments.cache_dir.mkdir(parents=True, exist_ok=True)
+    stale_marker = arguments.cache_dir / "STALE.txt"
+    if stale_marker.exists():
+        stale_marker.unlink()
+        print(f"Cleared staleness marker: {stale_marker}")
     metadata_path = arguments.cache_dir / "cache_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2))

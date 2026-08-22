@@ -11,8 +11,8 @@ This module handles:
 6. Labeling seizure risk during the following 10 minutes.
 7. Preserving local/cross seizure metadata when available.
 8. Splitting complete patients into train, validation, and test groups.
-9. Fitting one global channel z-score transform on training patients only.
-10. Applying those parameters to all splits.
+9. Applying the channel scalers fitted by seizure_prediction.normalization,
+   at global, per-patient, or per-recording scope.
 """
 
 from __future__ import annotations
@@ -28,6 +28,10 @@ import mne
 import numpy as np
 import pandas as pd
 from seizure_prediction.config import PreprocessingConfig
+from seizure_prediction.normalization import (
+    apply_channel_scaler,
+    select_scaler,
+)
 
 
 # ----------------------------------------------------------------------
@@ -1619,181 +1623,13 @@ def verify_no_shuffling(
 
 
 # ----------------------------------------------------------------------
-# Train-only patient/channel z-score fitting
+# Scaler persistence
 # ----------------------------------------------------------------------
-
-
-def fit_patient_channel_scalers(
-    metadata: pd.DataFrame,
-    unscaled_windows_dir: Path,
-    epsilon: float,
-) -> dict[str, dict[str, Any]]:
-    """
-    Fit patient/channel z-score parameters using training windows only.
-
-    The computation is performed incrementally so all EEG windows do not
-    need to be loaded simultaneously.
-    """
-    required_columns = {
-        "subject",
-        "recording_id",
-        "window_index_in_shard",
-        "split",
-    }
-
-    missing_columns = required_columns - set(metadata.columns)
-
-    if missing_columns:
-        raise ValueError(
-            "Metadata is missing scaler columns: "
-            f"{sorted(missing_columns)}"
-        )
-
-    accumulators: dict[str, dict[str, Any]] = {}
-
-    train_metadata = metadata[
-        metadata["split"] == "train"
-    ]
-
-    if train_metadata.empty:
-        raise ValueError("There are no training windows.")
-
-    for recording_id, recording_rows in train_metadata.groupby(
-        "recording_id",
-        sort=False,
-    ):
-        array_path = (
-            unscaled_windows_dir
-            / f"{recording_id}.npy"
-        )
-
-        if not array_path.exists():
-            raise FileNotFoundError(
-                f"Missing unscaled shard: {array_path}"
-            )
-
-        X = np.load(
-            array_path,
-            mmap_mode="r",
-        )
-
-        channel_names = load_channel_names_for_shard(
-            array_path
-        )
-
-        row_indices = recording_rows[
-            "window_index_in_shard"
-        ].to_numpy(dtype=np.int64)
-
-        selected = np.asarray(
-            X[row_indices],
-            dtype=np.float64,
-        )
-
-        subject = normalize_entity(
-            recording_rows["subject"].iloc[0]
-        )
-
-        if selected.ndim != 3:
-            raise ValueError(
-                f"Expected 3-D EEG data for {recording_id}, "
-                f"received shape {selected.shape}."
-            )
-
-        channel_count = selected.shape[1]
-
-        if len(channel_names) != channel_count:
-            raise ValueError(
-                f"Channel-name count does not match the data for "
-                f"{recording_id}."
-            )
-
-        if subject not in accumulators:
-            accumulators[subject] = {
-                "channel_names": channel_names,
-                "sum": np.zeros(
-                    channel_count,
-                    dtype=np.float64,
-                ),
-                "sum_squares": np.zeros(
-                    channel_count,
-                    dtype=np.float64,
-                ),
-                "count": np.zeros(
-                    channel_count,
-                    dtype=np.int64,
-                ),
-            }
-
-        accumulator = accumulators[subject]
-
-        if accumulator["channel_names"] != channel_names:
-            raise ValueError(
-                f"Channel order changed between recordings for "
-                f"subject {subject}.\n"
-                f"Expected: {accumulator['channel_names']}\n"
-                f"Found: {channel_names}"
-            )
-
-        accumulator["sum"] += selected.sum(
-            axis=(0, 2),
-            dtype=np.float64,
-        )
-
-        accumulator["sum_squares"] += np.square(
-            selected,
-            dtype=np.float64,
-        ).sum(
-            axis=(0, 2),
-            dtype=np.float64,
-        )
-
-        samples_per_channel = (
-            selected.shape[0]
-            * selected.shape[2]
-        )
-
-        accumulator["count"] += samples_per_channel
-
-    scalers: dict[str, dict[str, Any]] = {}
-
-    for subject, accumulator in accumulators.items():
-        count = accumulator["count"].astype(
-            np.float64
-        )
-
-        if np.any(count <= 0):
-            raise ValueError(
-                f"Subject {subject} has an empty scaler channel."
-            )
-
-        mean = accumulator["sum"] / count
-
-        variance = (
-            accumulator["sum_squares"] / count
-            - np.square(mean)
-        )
-
-        # Numerical roundoff can produce tiny negative values.
-        variance = np.maximum(variance, 0.0)
-
-        standard_deviation = np.sqrt(variance)
-
-        standard_deviation = np.maximum(
-            standard_deviation,
-            epsilon,
-        )
-
-        scalers[subject] = {
-            "channel_names": accumulator["channel_names"],
-            "mean": mean.tolist(),
-            "std": standard_deviation.tolist(),
-            "training_samples_per_channel": (
-                accumulator["count"].tolist()
-            ),
-        }
-
-    return scalers
+#
+# Fitting lives in seizure_prediction.normalization, which supports the
+# global, patient, and recording scopes over the current continuous
+# (channels, samples) layout.  The former patient-scoped helpers here were
+# written for the retired 3-D windowed layout and have been removed.
 
 
 def save_scaler(
@@ -1815,56 +1651,6 @@ def save_scaler(
             scaler_file,
             indent=2,
         )
-
-
-def apply_patient_channel_zscore(
-    X: np.ndarray,
-    subject: str,
-    channel_names: list[str],
-    scalers: dict[str, dict[str, Any]],
-    output_dtype: str,
-) -> np.ndarray:
-    """
-    Apply train-fitted patient/channel z-score parameters.
-    """
-    subject = normalize_entity(subject)
-
-    if subject not in scalers:
-        raise KeyError(
-            f"No training scaler exists for subject {subject}."
-        )
-
-    scaler = scalers[subject]
-
-    expected_channels = scaler["channel_names"]
-
-    if expected_channels != channel_names:
-        raise ValueError(
-            f"Channel order does not match the fitted scaler for "
-            f"subject {subject}.\n"
-            f"Expected: {expected_channels}\n"
-            f"Found: {channel_names}"
-        )
-
-    means = np.asarray(
-        scaler["mean"],
-        dtype=np.float32,
-    )[None, :, None]
-
-    standard_deviations = np.asarray(
-        scaler["std"],
-        dtype=np.float32,
-    )[None, :, None]
-
-    standardized = (
-        np.asarray(X, dtype=np.float32)
-        - means
-    ) / standard_deviations
-
-    return standardized.astype(
-        output_dtype,
-        copy=False,
-    )
 
 
 # ----------------------------------------------------------------------
@@ -2029,15 +1815,19 @@ def write_standardized_shards(
     metadata: pd.DataFrame,
     unscaled_recordings_dir: Path,
     processed_data_dir: Path,
-    scaler: dict[str, Any],
+    scaler_document: dict[str, Any],
     output_dtype: str,
 ) -> pd.DataFrame:
     """
     Standardize every continuous recording and save its decision metadata.
 
-    Each recording belongs to exactly one patient-level split.
+    Each recording belongs to exactly one patient-level split.  The scaler that
+    standardizes a recording is chosen from ``scaler_document`` according to its
+    normalization mode, so the same routine serves global, per-patient, and
+    per-recording scaling.
     """
     manifest_rows: list[dict[str, Any]] = []
+    normalization_mode = scaler_document["normalization_mode"]
 
     for recording_id, recording_metadata in metadata.groupby(
         "recording_id",
@@ -2085,11 +1875,16 @@ def write_standardized_shards(
                 dtype=np.float32,
             )
 
-            X_split = apply_global_channel_zscore(
+            X_split = apply_channel_scaler(
                 X=X_split_unscaled,
                 channel_names=channel_names,
                 channel_availability=channel_availability,
-                scaler=scaler,
+                scaler=select_scaler(
+                    scaler_document,
+                    subject=subject,
+                    recording_id=str(recording_id),
+                ),
+                document=scaler_document,
                 output_dtype=output_dtype,
             )
 
@@ -2179,6 +1974,7 @@ def write_standardized_shards(
                     "recording_id": recording_id,
                     "subject": subject,
                     "split": split_name,
+                    "normalization_mode": normalization_mode,
                     "number_of_decisions": len(y_split),
                     "number_of_positive_decisions": int(
                         np.sum(y_split == 1)
