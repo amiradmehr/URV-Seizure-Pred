@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,12 @@ def test_missing_channel_features_are_finite_zeros() -> None:
     np.testing.assert_array_equal(features[:, 1, :], 0.0)
 
 
-def test_channel_availability_loads_json(tmp_path: Path) -> None:
+def test_channel_availability_loads_json() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        _channel_availability_loads_json(Path(directory))
+
+
+def _channel_availability_loads_json(tmp_path: Path) -> None:
     path = tmp_path / "availability.json"
     path.write_text("[1, 0, 1]", encoding="utf-8")
     np.testing.assert_array_equal(
@@ -49,7 +55,12 @@ def test_alpha_sine_has_largest_alpha_bandpower() -> None:
     assert int(np.argmax(bandpowers)) == 2
 
 
-def test_decision_summary_uses_45_minute_context(tmp_path: Path) -> None:
+def test_decision_summary_uses_45_minute_context() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        _decision_summary_uses_45_minute_context(Path(directory))
+
+
+def _decision_summary_uses_45_minute_context(tmp_path: Path) -> None:
     signal_path = tmp_path / "processed" / "train" / "recording_X.npy"
     signal_path.parent.mkdir(parents=True)
     np.save(signal_path, np.zeros((3, 46), dtype=np.float32))

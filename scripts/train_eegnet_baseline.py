@@ -33,6 +33,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from matplotlib.patches import FancyBboxPatch
 from sklearn.metrics import average_precision_score, precision_recall_curve
@@ -50,6 +51,14 @@ if str(SRC_DIRECTORY) not in sys.path:
 
 
 from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.cross_validation import (  # noqa: E402
+    make_patient_folds,
+    split_examples_by_fold,
+    verify_fold_isolation,
+)
+from seizure_prediction.positional_controls import (  # noqa: E402
+    positional_baseline_report,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     PatientEventBalancedEpochSampler,
@@ -122,6 +131,50 @@ def parse_arguments() -> argparse.Namespace:
         default=6,
         help="Stop after this many epochs without better validation AP.",
     )
+    parser.add_argument(
+        "--validation-batch-size",
+        type=int,
+        default=16,
+        help=(
+            "Inference batch size. Training uses a tiny batch to fit the "
+            "45-minute contexts with gradients; validation needs no gradients, "
+            "so reusing batch size 2 there makes evaluation dominate the run."
+        ),
+    )
+    parser.add_argument(
+        "--validation-monitor-ratio",
+        type=float,
+        default=20.0,
+        help=(
+            "Negatives per positive in the per-epoch monitoring set. Scoring "
+            "the whole split every epoch reads roughly 800 GB and costs about "
+            "six times the training steps, so epoch selection runs on a fixed "
+            "seeded subsample and the best checkpoint is then scored on the "
+            "complete split. Zero disables subsampling."
+        ),
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=0,
+        help=(
+            "Run patient-level cross-validation inside the training patients "
+            "instead of scoring the fixed validation split. Zero disables it. "
+            "The real validation and test splits stay untouched."
+        ),
+    )
+    parser.add_argument(
+        "--cv-fold",
+        type=int,
+        default=0,
+        help="Zero-based fold to hold out when --cv-folds is set.",
+    )
+    parser.add_argument(
+        "--cv-seed",
+        type=int,
+        default=0,
+        help="Seed for the fold partition, held fixed across model seeds.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -143,6 +196,7 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     positive_integer_names = (
         "epochs",
         "batch_size",
+        "validation_batch_size",
         "embedding_dim",
         "encoder_chunk_batch_size",
         "gradient_accumulation_steps",
@@ -504,13 +558,48 @@ def save_metrics(
     history: list[dict[str, float | int]],
     best_epoch: int,
     best_average_precision: float,
+    positional: dict[str, float],
+    full_average_precision: float | None = None,
 ) -> None:
-    """Write one concise, machine-readable record of the baseline run."""
+    """Write one concise, machine-readable record of the baseline run.
+
+    ``best_average_precision`` comes from the per-epoch monitoring subsample and
+    selects the checkpoint. ``full_average_precision`` is the same checkpoint
+    scored on the complete split, and is the only figure comparable with the
+    positional baseline, which is always measured on that complete split.
+    """
+    positional_average_precision = float(
+        positional["best_positional_average_precision"]
+    )
+    reported = (
+        best_average_precision
+        if full_average_precision is None
+        else full_average_precision
+    )
     output_path.write_text(
         json.dumps(
             {
                 "model": "BaselineEEGNet",
                 "input_normalization": processed_normalization(),
+                "evaluation_split": (
+                    f"cv_fold_{arguments.cv_fold}_of_{arguments.cv_folds}"
+                    if arguments.cv_folds
+                    else "fixed_validation_split"
+                ),
+                "positional_control": {
+                    **{
+                        name: float(value)
+                        for name, value in positional.items()
+                    },
+                    "model_beats_positional_baseline": bool(
+                        reported > positional_average_precision
+                    ),
+                    "margin_over_positional_baseline": (
+                        reported / positional_average_precision
+                        if positional_average_precision > 0
+                        else float("nan")
+                    ),
+                },
                 "primary_comparison_metric": "validation_average_precision",
                 "training_metric": "binary_cross_entropy",
                 "validation_metrics": [
@@ -547,7 +636,9 @@ def save_metrics(
                 },
                 "history": history,
                 "best_epoch": best_epoch,
-                "best_validation_average_precision": best_average_precision,
+                "best_validation_average_precision": reported,
+                "monitor_subsample_average_precision": best_average_precision,
+                "scored_on_full_split": full_average_precision is not None,
             },
             indent=2,
         ),
@@ -580,12 +671,36 @@ def main() -> None:
         negative_to_positive_ratio=None,
         seed=arguments.seed,
     )
-    validation_examples = load_decision_examples(
-        manifest_path,
-        split="validation",
-        negative_to_positive_ratio=None,
-        seed=arguments.seed,
-    )
+    if arguments.cv_folds:
+        folds = make_patient_folds(
+            train_examples,
+            folds=arguments.cv_folds,
+            seed=arguments.cv_seed,
+        )
+        verify_fold_isolation(folds)
+        if not 0 <= arguments.cv_fold < arguments.cv_folds:
+            raise ValueError(
+                f"cv-fold must be in [0, {arguments.cv_folds})."
+            )
+        fold = folds[arguments.cv_fold]
+        train_examples, validation_examples = split_examples_by_fold(
+            train_examples,
+            fold,
+        )
+        print(
+            f"Cross-validation fold {fold.index + 1}/{arguments.cv_folds}: "
+            f"{len(fold.train_subjects)} train patients "
+            f"({fold.train_seizures} seizures), "
+            f"{len(fold.validation_subjects)} held-out patients "
+            f"({fold.validation_seizures} seizures)."
+        )
+    else:
+        validation_examples = load_decision_examples(
+            manifest_path,
+            split="validation",
+            negative_to_positive_ratio=None,
+            seed=arguments.seed,
+        )
     if arguments.sampling_strategy == "patient-event-balanced":
         train_sampler = PatientEventBalancedEpochSampler(
             train_examples,
@@ -608,7 +723,7 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
-        batch_size=arguments.batch_size,
+        batch_size=arguments.validation_batch_size,
         num_workers=arguments.num_workers,
         device=device,
     )
@@ -683,7 +798,50 @@ def main() -> None:
     best_epoch = 0
     epochs_without_improvement = 0
 
+    positional = positional_baseline_report(validation_examples)
+
+    # Epoch selection runs on a fixed subsample; the reported number always
+    # comes from the complete split after the best checkpoint is reloaded.
+    if arguments.validation_monitor_ratio > 0:
+        monitor_positives = validation_examples[validation_examples["label"] == 1]
+        monitor_negatives = validation_examples[validation_examples["label"] == 0]
+        wanted = int(
+            round(len(monitor_positives) * arguments.validation_monitor_ratio)
+        )
+        monitor_examples = pd.concat(
+            [
+                monitor_positives,
+                monitor_negatives.sample(
+                    n=min(wanted, len(monitor_negatives)),
+                    random_state=arguments.seed,
+                ),
+            ]
+        ).sort_index()
+        monitor_loader = build_loader(
+            monitor_examples,
+            batch_size=arguments.validation_batch_size,
+            num_workers=arguments.num_workers,
+            device=device,
+        )
+        monitor_positional = positional_baseline_report(monitor_examples)
+        print(
+            f"Monitoring on {len(monitor_examples):,} of "
+            f"{len(validation_examples):,} validation decisions "
+            f"({len(validation_examples) / len(monitor_examples):.1f}x faster "
+            "per epoch); the best checkpoint is scored on all of them."
+        )
+    else:
+        monitor_examples = validation_examples
+        monitor_loader = validation_loader
+        monitor_positional = positional
+
     print(f"Device: {device}")
+    print(
+        "Positional baseline (no EEG read): "
+        f"AP={positional['best_positional_average_precision']:.4f}, "
+        f"lift={positional['best_positional_lift']:.2f}x. "
+        "A run that does not clear this has shown nothing about EEG."
+    )
     print(
         "Input normalization: "
         f"mode={normalization['normalization_mode']}, "
@@ -753,7 +911,7 @@ def main() -> None:
 
         validation_result = evaluate(
             model,
-            validation_loader,
+            monitor_loader,
             criterion,
             device,
             logit_correction,
@@ -800,6 +958,7 @@ def main() -> None:
             history=history,
             best_epoch=best_epoch,
             best_average_precision=best_average_precision,
+            positional=positional,
         )
 
         if epochs_without_improvement >= arguments.early_stopping_patience:
@@ -822,6 +981,33 @@ def main() -> None:
         device,
         logit_correction,
     )
+    # Epoch selection used the subsample; the number that gets reported and
+    # compared against the positional baseline must come from the full split.
+    save_metrics(
+        output_path=metrics_path,
+        arguments=arguments,
+        counts=counts,
+        population_positive_fraction=population_positive_fraction,
+        sampled_positive_fraction=sampled_positive_fraction,
+        logit_correction=logit_correction,
+        history=history,
+        best_epoch=best_epoch,
+        best_average_precision=best_validation_result.average_precision,
+        positional=positional,
+    )
+    save_metrics(
+        output_path=metrics_path,
+        arguments=arguments,
+        counts=counts,
+        population_positive_fraction=population_positive_fraction,
+        sampled_positive_fraction=sampled_positive_fraction,
+        logit_correction=logit_correction,
+        history=history,
+        best_epoch=best_epoch,
+        best_average_precision=best_average_precision,
+        positional=positional,
+        full_average_precision=best_validation_result.average_precision,
+    )
     validation_prevalence = validation_positive_count / len(validation_examples)
     save_learning_curves(
         history,
@@ -831,7 +1017,16 @@ def main() -> None:
     )
     save_validation_summary(best_validation_result, validation_summary_path)
 
-    print(f"Best validation AP: {best_average_precision:.6f} at epoch {best_epoch}")
+    print(
+        f"Best epoch {best_epoch} selected on the monitoring subsample "
+        f"(AP {best_average_precision:.6f})."
+    )
+    print(
+        "Full validation split AP: "
+        f"{best_validation_result.average_precision:.6f}  "
+        f"(lift {best_validation_result.average_precision / positional['prevalence']:.2f}x, "
+        f"positional baseline {positional['best_positional_lift']:.2f}x)"
+    )
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Metrics: {metrics_path}")
     print(f"Model overview: {model_overview_path}")
