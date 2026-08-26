@@ -41,6 +41,9 @@ if str(SRC_DIRECTORY) not in sys.path:
 
 
 from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.positional_controls import (  # noqa: E402
+    evaluate_against_positional_controls,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     CachedEmbeddingDecisionDataset,
     load_decision_examples,
@@ -480,6 +483,30 @@ def main() -> None:
     target_seizures = prepare_target_seizures(seizure_manifest, target_ids)
     validate_positive_timing(predictions, target_seizures)
 
+    # Positive decisions cluster at the end of their recordings, so a scorer
+    # that never reads EEG reaches roughly a 5x lift here. Reporting it beside
+    # the model is what keeps that from being mistaken for performance.
+    positional_control = evaluate_against_positional_controls(
+        predictions,
+        score_column="probability",
+        seed=arguments.seed,
+    )
+    full_control = positional_control["full"]
+    matched_control = positional_control["position_matched"]
+    print(
+        "\nPositional control:"
+        f"\n  model                 AP={full_control['model_average_precision']:.4f}"
+        f"  lift={full_control['model_lift']:.2f}x"
+        f"\n  positional baseline   AP="
+        f"{full_control['best_positional_average_precision']:.4f}"
+        f"  lift={full_control['best_positional_lift']:.2f}x"
+        f"\n  position-matched      lift={matched_control['model_lift']:.2f}x"
+        f"  (residual {matched_control['best_positional_lift']:.2f}x)"
+        f"\n  beats the baseline    "
+        f"{full_control['beats_positional_baseline']} raw, "
+        f"{matched_control['beats_positional_baseline']} matched"
+    )
+
     validation_ap = float(
         average_precision_score(
             predictions["label"].to_numpy(dtype=np.int64),
@@ -573,6 +600,7 @@ def main() -> None:
         "checkpoint_sha256": sha256_file(arguments.checkpoint),
         "best_training_epoch": checkpoint.get("best_epoch"),
         "model_config": asdict(model_config),
+        "positional_control": positional_control,
         "validation": {
             "decisions": int(len(predictions)),
             "positive_decisions": int((predictions["label"] == 1).sum()),

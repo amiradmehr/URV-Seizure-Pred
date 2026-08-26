@@ -49,6 +49,7 @@ from seizure_prediction.config import CONFIG  # noqa: E402
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     CachedEmbeddingDecisionDataset,
+    StreamingDecisionDataset,
     load_decision_examples,
 )
 from seizure_prediction.models import (  # noqa: E402
@@ -90,6 +91,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Stop after this many epochs without better validation AP.",
     )
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help=(
+            "Read raw chunks and train the encoder together with the temporal "
+            "head. The cached-embedding default freezes an encoder that was "
+            "trained under mean pooling, so its features carry no chunk order "
+            "for the head to use -- which is why the frozen runs could not "
+            "improve on epoch zero."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
@@ -239,13 +251,25 @@ def build_loader(
     num_workers: int,
     device: torch.device,
     sampler: Sampler[int] | None = None,
+    end_to_end: bool = False,
 ) -> DataLoader:
-    """Build a loader over compact cached decision histories."""
-    dataset = CachedEmbeddingDecisionDataset(
-        examples,
-        CONFIG,
-        cache_root=cache_dir,
-        embedding_dim=embedding_dim,
+    """Build a loader over cached histories, or raw chunks for end-to-end.
+
+    The cached path is far cheaper but freezes the encoder by construction:
+    the embeddings were produced by an encoder trained under a mean-pooling
+    objective, so they carry no chunk order for a temporal head to recover.
+    Training end to end reads raw chunks instead and puts the encoder back in
+    the graph.
+    """
+    dataset = (
+        StreamingDecisionDataset(examples, CONFIG)
+        if end_to_end
+        else CachedEmbeddingDecisionDataset(
+            examples,
+            CONFIG,
+            cache_root=cache_dir,
+            embedding_dim=embedding_dim,
+        )
     )
     return DataLoader(
         dataset,
@@ -264,6 +288,7 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     logit_correction: float,
+    end_to_end: bool = False,
 ) -> EvaluationResult:
     """Evaluate loss and AP on the full patient-held-out validation split."""
     model.eval()
@@ -272,12 +297,16 @@ def evaluate(
     labels: list[float] = []
     probabilities: list[float] = []
     with torch.inference_mode():
-        for embeddings, availability, target in loader:
-            embeddings = embeddings.to(device, non_blocking=True)
+        for inputs, availability, target in loader:
+            inputs = inputs.to(device, non_blocking=True)
             availability = availability.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             corrected_logits = (
-                model.forward_from_chunk_embeddings(embeddings, availability)
+                (
+                    model(inputs, availability)
+                    if end_to_end
+                    else model.forward_from_chunk_embeddings(inputs, availability)
+                )
                 + logit_correction
             )
             loss = criterion(corrected_logits, target)
@@ -307,21 +336,27 @@ def train_epoch(
     optimizer: AdamW,
     device: torch.device,
     max_grad_norm: float,
+    end_to_end: bool = False,
 ) -> float:
-    """Train only the residual temporal head for one balanced epoch."""
+    """Train the temporal head, and the encoder too when end to end."""
     model.train()
-    model.keep_frozen_baseline_in_eval_mode()
+    if not end_to_end:
+        model.keep_frozen_baseline_in_eval_mode()
     cumulative_loss = 0.0
     examples_seen = 0
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
-    for embeddings, availability, target in loader:
-        embeddings = embeddings.to(device, non_blocking=True)
+    for inputs, availability, target in loader:
+        inputs = inputs.to(device, non_blocking=True)
         availability = availability.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        logits = model.forward_from_chunk_embeddings(embeddings, availability)
+        logits = (
+            model(inputs, availability)
+            if end_to_end
+            else model.forward_from_chunk_embeddings(inputs, availability)
+        )
         loss = criterion(logits, target)
         loss.backward()
         clip_grad_norm_(trainable_parameters, max_grad_norm)
@@ -580,6 +615,7 @@ def main() -> None:
         num_workers=arguments.num_workers,
         device=device,
         sampler=train_sampler,
+        end_to_end=arguments.end_to_end,
     )
     validation_loader = build_loader(
         validation_examples,
@@ -588,6 +624,7 @@ def main() -> None:
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
+        end_to_end=arguments.end_to_end,
     )
 
     train_positive_count = int((train_examples["label"] == 1).sum())
@@ -608,7 +645,7 @@ def main() -> None:
     )
     model = EEGNetMultiScaleTemporalRiskModel(model_config)
     model.initialize_from_baseline_state_dict(baseline_state_dict)
-    model.set_baseline_trainable(False)
+    model.set_baseline_trainable(arguments.end_to_end)
     model.to(device)
 
     optimizer = AdamW(
@@ -651,6 +688,7 @@ def main() -> None:
         criterion,
         device,
         logit_correction,
+        end_to_end=arguments.end_to_end,
     )
     history: list[dict[str, float | int | str | None]] = [
         {
@@ -687,6 +725,7 @@ def main() -> None:
             optimizer,
             device,
             arguments.max_grad_norm,
+            end_to_end=arguments.end_to_end,
         )
         validation_result = evaluate(
             model,
@@ -694,6 +733,7 @@ def main() -> None:
             criterion,
             device,
             logit_correction,
+            end_to_end=arguments.end_to_end,
         )
         row: dict[str, float | int | str | None] = {
             "epoch": epoch,
@@ -753,6 +793,7 @@ def main() -> None:
         criterion,
         device,
         logit_correction,
+        end_to_end=arguments.end_to_end,
     )
     save_metrics(
         path=metrics_path,

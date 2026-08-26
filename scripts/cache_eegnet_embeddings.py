@@ -312,6 +312,13 @@ def main() -> None:
         "storage_dtype": str(storage_dtype),
     }
     arguments.cache_dir.mkdir(parents=True, exist_ok=True)
+    # A rebuilt cache matches the current data/processed again, so the
+    # staleness marker left by scripts/restandardize_processed.py no longer
+    # applies. Leaving it would make consumers refuse a valid cache.
+    stale_marker = arguments.cache_dir / "STALE.txt"
+    if stale_marker.exists():
+        stale_marker.unlink()
+        print(f"Cleared staleness marker: {stale_marker}")
     (arguments.cache_dir / "cache_metadata.json").write_text(
         json.dumps(metadata, indent=2),
         encoding="utf-8",
