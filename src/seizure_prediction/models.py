@@ -9,13 +9,53 @@ from braindecode.models import EEGNet
 from torch import nn
 
 
+# Candidate temporal scales for the multi-scale head, shortest first. The
+# scales actually used are those that fit inside the input window; see
+# `temporal_windows_for_history`.
+CANDIDATE_TEMPORAL_WINDOW_MINUTES: tuple[int, ...] = (1, 5, 15, 30)
+
+
+def temporal_windows_for_history(
+    history_minutes: int,
+) -> tuple[int, ...]:
+    """Return the multi-scale contrast windows for one input history.
+
+    The head contrasts nested recent-history means, and its widest scale must
+    be the complete history -- that is the term that reproduces the baseline's
+    mean pooling.  Sweeping the input window therefore changes the scale set:
+    a 30-minute history supports (1, 5, 15, 30) while a 5-minute history
+    supports only (1, 5).  Candidate scales wider than the history are dropped
+    rather than clipped, so no two scales collapse onto the same mean.
+    """
+    if history_minutes <= 0:
+        raise ValueError("history_minutes must be positive.")
+
+    windows = tuple(
+        window
+        for window in CANDIDATE_TEMPORAL_WINDOW_MINUTES
+        if window < history_minutes
+    ) + (history_minutes,)
+
+    if len(windows) < 2:
+        raise ValueError(
+            f"A {history_minutes}-minute history admits only one temporal "
+            "scale, so the multi-scale head has no contrast to form. Use the "
+            "baseline model instead."
+        )
+
+    return windows
+
+
 @dataclass(frozen=True)
 class BaselineEEGNetConfig:
-    """Dimensions and regularization for the 45-minute EEGNet baseline."""
+    """Dimensions and regularization for the EEGNet baseline."""
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
-    sequence_chunks: int = 45 * 60 // 5
+    # The default matches the widest swept input window. Every training script
+    # derives this from the label definition it was asked for, so the default
+    # applies only to a config constructed by hand.
+    sequence_chunks: int = 30 * 60 // 5
     embedding_dim: int = 32
     encoder_chunk_batch_size: int = 128
     dropout: float = 0.4
@@ -23,7 +63,8 @@ class BaselineEEGNetConfig:
 
 
 class BaselineEEGNet(nn.Module):
-    """Predict next-10-minute seizure risk from 45 minutes of EEG.
+    """Predict seizure risk over the configured seizure occurrence period
+    from the configured input window of EEG.
 
     EEGNet independently converts each five-second chunk into a compact feature
     vector. Mean pooling gives every chunk equal weight and intentionally
@@ -169,17 +210,21 @@ class EEGNetMultiScaleTemporalConfig:
 
     Five-second EEGNet embeddings are first averaged into minute-level
     embeddings.  Causal contrasts between nested recent-history windows add
-    temporal information while the original 45-minute mean-pooling path is
+    temporal information while the original whole-history mean-pooling path is
     retained as an exact baseline bypass.
+
+    ``temporal_windows_minutes`` must end at the complete input history, so it
+    changes with the swept input window; build it with
+    `temporal_windows_for_history` rather than relying on the default.
     """
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
-    sequence_chunks: int = 45 * 60 // 5
+    sequence_chunks: int = 30 * 60 // 5
     chunks_per_minute: int = 60 // 5
     embedding_dim: int = 32
     temporal_hidden_dim: int = 16
-    temporal_windows_minutes: tuple[int, ...] = (1, 5, 15, 45)
+    temporal_windows_minutes: tuple[int, ...] = (1, 5, 15, 30)
     encoder_chunk_batch_size: int = 128
     encoder_dropout: float = 0.4
     temporal_dropout: float = 0.2
@@ -200,8 +245,10 @@ class EEGNetMultiScaleTemporalRiskModel(nn.Module):
     """Add small causal temporal contrasts to the robust EEGNet baseline.
 
     The baseline branch is mathematically the same as :class:`BaselineEEGNet`:
-    all five-second embeddings receive equal weight over 45 minutes.  A second
-    branch compares nested 1-, 5-, 15-, and 45-minute means.  Its final layer
+    all five-second embeddings receive equal weight over the whole input window.
+    A second branch compares nested embedding means at scales derived from that
+    window (see :func:`temporal_windows_for_history`, e.g. 1-, 5-, 15-, and
+    30-minute for a 30-minute window).  Its final layer
     is initialized to zero, so a model initialized from a baseline checkpoint
     produces the exact baseline logit before temporal-head training begins.
 
@@ -270,7 +317,10 @@ class EEGNetMultiScaleTemporalRiskModel(nn.Module):
             )
         if windows[-1] != config.history_minutes:
             raise ValueError(
-                "The final temporal window must equal the complete input history."
+                "The final temporal window must equal the complete input "
+                f"history of {config.history_minutes} minutes; found "
+                f"{windows[-1]}. Build the windows with "
+                "temporal_windows_for_history for the input window in use."
             )
         for name, dropout in (
             ("encoder_dropout", config.encoder_dropout),
@@ -464,7 +514,7 @@ class EEGNetRecencyWeightedConfig:
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
-    sequence_chunks: int = 45 * 60 // 5
+    sequence_chunks: int = 30 * 60 // 5
     chunks_per_minute: int = 60 // 5
     embedding_dim: int = 32
     encoder_chunk_batch_size: int = 128
@@ -485,7 +535,7 @@ class EEGNetRecencyWeightedRiskModel(nn.Module):
     Only one logit per minute is learned. Softmax produces nonnegative weights
     that sum to one, and ``max_temporal_strength`` mixes them with a fixed
     uniform distribution. The model therefore begins as the exact baseline and
-    cannot completely discard any part of the 45-minute history.
+    cannot completely discard any part of the configured input window.
     """
 
     def __init__(self, config: EEGNetRecencyWeightedConfig) -> None:

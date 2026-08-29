@@ -63,7 +63,11 @@ SRC_DIRECTORY = PROJECT_ROOT / "src"
 if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import load_decision_examples  # noqa: E402
 from seizure_prediction.handcrafted_features import (  # noqa: E402
     build_decision_feature_matrix,
@@ -100,9 +104,7 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "handcrafted_feature_cache"
+            CONFIG.handcrafted_feature_cache_dir
             / "ava_minute_selected_v1"
         ),
         help="Handcrafted minute-feature cache with complete per-patient coverage.",
@@ -152,6 +154,7 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "outputs" / "analysis" / "per_patient_loso",
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -180,9 +183,13 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         )
 
 
-def load_all_examples(splits: tuple[str, ...], seed: int) -> pd.DataFrame:
+def load_all_examples(
+    splits: tuple[str, ...],
+    seed: int,
+    config,
+) -> pd.DataFrame:
     """Load every decision from the requested splits, at natural prevalence."""
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Processed manifest not found: {manifest_path}")
 
@@ -193,6 +200,7 @@ def load_all_examples(splits: tuple[str, ...], seed: int) -> pd.DataFrame:
             split=split,
             negative_to_positive_ratio=None,
             seed=seed,
+            project_root=config.project_root,
         )
         split_examples["split"] = split
         frames.append(split_examples)
@@ -403,14 +411,15 @@ def main() -> None:
     """Run the per-patient diagnostic and write an auditable summary."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(SEPARATOR)
     print("PER-PATIENT LEAVE-ONE-RECORDING-OUT DIAGNOSTIC".center(90))
     print(SEPARATOR)
 
-    examples = load_all_examples(tuple(arguments.splits), arguments.seed)
+    examples = load_all_examples(tuple(arguments.splits), arguments.seed, config)
     patients = eligible_patients(examples, arguments.minimum_events)
     if not patients:
         raise ValueError(
@@ -422,7 +431,7 @@ def main() -> None:
     print(f"Permutations        : {arguments.permutations}")
     print(f"Feature cache       : {arguments.cache_dir}")
 
-    feature_names = decision_feature_names(CONFIG.canonical_channel_names)
+    feature_names = decision_feature_names(config.canonical_channel_names)
     results: list[PatientResult] = []
     fold_frames: list[pd.DataFrame] = []
 
@@ -451,7 +460,8 @@ def main() -> None:
         features = build_decision_feature_matrix(
             patient_examples,
             arguments.cache_dir,
-            sampling_frequency=CONFIG.target_sfreq,
+            sampling_frequency=config.target_sfreq,
+            history_minutes=int(round(config.input_window_seconds / 60.0)),
         )
         scores, held_out_labels, fold_names = out_of_fold_predictions(
             features,

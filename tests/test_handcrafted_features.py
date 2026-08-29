@@ -49,7 +49,7 @@ def test_alpha_sine_has_largest_alpha_bandpower() -> None:
     assert int(np.argmax(bandpowers)) == 2
 
 
-def test_decision_summary_uses_45_minute_context(tmp_path: Path) -> None:
+def test_decision_summary_uses_the_configured_history(tmp_path: Path) -> None:
     signal_path = tmp_path / "processed" / "train" / "recording_X.npy"
     signal_path.parent.mkdir(parents=True)
     np.save(signal_path, np.zeros((3, 46), dtype=np.float32))
@@ -74,7 +74,11 @@ def test_decision_summary_uses_45_minute_context(tmp_path: Path) -> None:
         },
         index=[10, 20],
     )
-    matrix = build_decision_feature_matrix(examples, cache_root)
+    matrix = build_decision_feature_matrix(
+        examples,
+        cache_root,
+        history_minutes=45,
+    )
     names = decision_feature_names(("BTE_LEFT", "BTE_RIGHT", "CROSS_HEAD"))
     assert matrix.shape == (2, len(names))
     np.testing.assert_allclose(matrix[:, 0], [22.0, 23.0])

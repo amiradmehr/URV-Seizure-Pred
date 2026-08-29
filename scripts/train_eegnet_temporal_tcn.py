@@ -1,8 +1,9 @@
 r"""Train EEGNet plus a causal temporal TCN for seizure-risk prediction.
 
 EEGNet converts each five-second EEG chunk into a local embedding. A causal,
-dilated temporal convolutional network then processes all 540 embeddings in
-chronological order before predicting seizure onset in the next 10 minutes.
+dilated temporal convolutional network then processes every chunk embedding
+of the configured input window in chronological order before predicting
+seizure onset in the following seizure occurrence period.
 
 Training uses every positive decision and a configurable, non-repeating slice
 of negatives in each epoch. Validation always uses the full natural split.
@@ -44,11 +45,15 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     StreamingDecisionDataset,
     load_decision_examples,
+    load_scaler_document,
 )
 from seizure_prediction.models_old import (  # noqa: E402
     EEGNetTemporalTCNConfig,
@@ -113,6 +118,7 @@ def parse_arguments() -> argparse.Namespace:
             / "eegnet_temporal_tcn_ratio10_prior_corrected"
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -139,13 +145,19 @@ def resolve_device(requested_device: str) -> torch.device:
 def build_loader(
     examples,
     *,
+    config,
+    scaler_document: dict,
     batch_size: int,
     num_workers: int,
     device: torch.device,
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
-    """Build a lazy loader over continuous recordings."""
-    dataset = StreamingDecisionDataset(examples, CONFIG)
+    """Build a lazy loader over continuous recordings.
+
+    The dataset standardizes each history as it is sliced, since the shards
+    reference the shared filtered recordings rather than standardized copies.
+    """
+    dataset = StreamingDecisionDataset(examples, config, scaler_document)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -364,7 +376,8 @@ def evaluate(
 def main() -> None:
     """Train and checkpoint the EEGNet plus temporal TCN model."""
     arguments = parse_arguments()
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     if arguments.epochs <= 0 or arguments.batch_size <= 0:
         raise ValueError("epochs and batch-size must be positive.")
     if arguments.num_workers < 0:
@@ -388,24 +401,30 @@ def main() -> None:
 
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Processed manifest not found: {manifest_path}. "
             "Run build_dataset.py and validate_dataset.py first."
         )
 
+    # The shards reference filtered, unstandardized EEG, so the scaler is
+    # loaded here and applied by the dataset as each history is sliced.
+    scaler_document = load_scaler_document(manifest_path, config.project_root)
+
     all_train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     train_sampler = BalancedEpochSampler(
         all_train_examples["label"],
@@ -414,6 +433,8 @@ def main() -> None:
     )
     train_loader = build_loader(
         all_train_examples,
+        config=config,
+        scaler_document=scaler_document,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
@@ -421,13 +442,15 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
+        config=config,
+        scaler_document=scaler_document,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
     )
 
     sequence_chunks = int(
-        round(CONFIG.input_window_seconds / CONFIG.chunk_window_seconds)
+        round(config.input_window_seconds / config.chunk_window_seconds)
     )
     train_positive_count = int((all_train_examples["label"] == 1).sum())
     train_negative_count = int((all_train_examples["label"] == 0).sum())
@@ -439,8 +462,8 @@ def main() -> None:
     )
 
     model_config = EEGNetTemporalTCNConfig(
-        n_chans=len(CONFIG.canonical_channel_names),
-        chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+        n_chans=len(config.canonical_channel_names),
+        chunk_samples=int(config.chunk_window_seconds * config.target_sfreq),
         sequence_chunks=sequence_chunks,
         embedding_dim=arguments.embedding_dim,
         tcn_channels=arguments.tcn_channels,
@@ -590,14 +613,14 @@ def main() -> None:
                     "model_state_dict": model.state_dict(),
                     "model_config": asdict(model_config),
                     "config": {
-                        "target_sfreq": CONFIG.target_sfreq,
-                        "input_window_seconds": CONFIG.input_window_seconds,
-                        "chunk_window_seconds": CONFIG.chunk_window_seconds,
+                        "target_sfreq": config.target_sfreq,
+                        "input_window_seconds": config.input_window_seconds,
+                        "chunk_window_seconds": config.chunk_window_seconds,
                         "canonical_channel_names": list(
-                            CONFIG.canonical_channel_names
+                            config.canonical_channel_names
                         ),
                         "seizure_occurrence_period_minutes": (
-                            CONFIG.seizure_occurrence_period_minutes
+                            config.seizure_occurrence_period_minutes
                         ),
                     },
                     "training_arguments": vars(arguments),

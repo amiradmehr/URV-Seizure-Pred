@@ -12,12 +12,27 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from seizure_prediction.config import PreprocessingConfig
+from seizure_prediction.normalization import select_scaler
 
 
-def resolve_stored_path(path_value: str | Path) -> Path:
-    """Resolve manifest paths written on Windows when training inside WSL."""
+def resolve_stored_path(
+    path_value: str | Path,
+    project_root: Path | None = None,
+) -> Path:
+    """
+    Resolve a manifest path to a file on this machine.
+
+    Manifests store paths relative to the project root so a data tree can be
+    copied to another machine without rewriting every row; ``project_root``
+    anchors those.  Absolute paths written on Windows are also rewritten to
+    their ``/mnt/<drive>`` form when training inside WSL.
+    """
     path_text = str(path_value)
     native_path = Path(path_text)
+
+    if not native_path.is_absolute() and project_root is not None:
+        return project_root / native_path
+
     if native_path.exists() or os.name == "nt":
         return native_path
 
@@ -29,11 +44,52 @@ def resolve_stored_path(path_value: str | Path) -> Path:
     return native_path
 
 
+def load_scaler_document(
+    processed_manifest_path: Path,
+    project_root: Path | None = None,
+) -> dict:
+    """
+    Load the scaler document the processed shards were built against.
+
+    The shards reference filtered, unstandardized EEG, so every consumer has
+    to standardize on read.  Each manifest row records the document that
+    build fitted, which keeps the choice of normalization with the data
+    rather than in a flag a caller has to remember to repeat.
+    """
+    manifest = pd.read_csv(processed_manifest_path)
+
+    if "scaler_document_path" not in manifest.columns:
+        raise ValueError(
+            f"{processed_manifest_path} has no 'scaler_document_path' column. "
+            "Rebuild it with scripts/build_dataset.py."
+        )
+
+    document_paths = sorted(set(manifest["scaler_document_path"].astype(str)))
+
+    if len(document_paths) != 1:
+        raise ValueError(
+            "A processed manifest must reference exactly one scaler "
+            f"document; found {document_paths}."
+        )
+
+    resolved = resolve_stored_path(document_paths[0], project_root)
+
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"The scaler document {resolved} referenced by "
+            f"{processed_manifest_path} does not exist."
+        )
+
+    with resolved.open("r", encoding="utf-8") as document_file:
+        return json.load(document_file)
+
+
 def load_decision_examples(
     processed_manifest_path: Path,
     split: str,
     negative_to_positive_ratio: float | None = None,
     seed: int = 0,
+    project_root: Path | None = None,
 ) -> pd.DataFrame:
     """Load decision metadata for one split without loading EEG into memory.
 
@@ -41,8 +97,13 @@ def load_decision_examples(
     are retained and a reproducible random subset of negatives is used. This
     controls the substantial class imbalance during baseline training while
     leaving the underlying processed recordings unchanged.
+
+    ``project_root`` anchors the project-relative paths the manifest stores.
     """
-    manifest = pd.read_csv(processed_manifest_path, dtype={"subject": str})
+    manifest = pd.read_csv(
+        processed_manifest_path,
+        dtype={"subject": str, "recording_id": str},
+    )
     split_manifest = manifest[manifest["split"] == split]
     if split_manifest.empty:
         raise ValueError(f"No processed shards were found for split {split!r}.")
@@ -69,12 +130,17 @@ def load_decision_examples(
     }
     for manifest_row in split_manifest.itertuples(index=False):
         metadata = pd.read_csv(
-            resolve_stored_path(manifest_row.metadata_path),
+            resolve_stored_path(manifest_row.metadata_path, project_root),
             dtype=metadata_dtypes,
         )
-        metadata["X_path"] = str(resolve_stored_path(manifest_row.X_path))
+        metadata["X_path"] = str(
+            resolve_stored_path(manifest_row.X_path, project_root)
+        )
         metadata["channel_availability_path"] = str(
-            resolve_stored_path(manifest_row.channel_availability_path)
+            resolve_stored_path(
+                manifest_row.channel_availability_path,
+                project_root,
+            )
         )
         frames.append(metadata)
 
@@ -85,6 +151,10 @@ def load_decision_examples(
         "decision_end_sample",
         "X_path",
         "channel_availability_path",
+        # Needed to select each decision's scaler, since the referenced EEG is
+        # the shared filtered recording rather than a standardized copy.
+        "subject",
+        "recording_id",
     }
     missing_columns = required_metadata_columns - set(examples.columns)
     if missing_columns:
@@ -437,17 +507,36 @@ class PatientEventBalancedEpochSampler(Sampler[int]):
 
 
 class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
-    """Lazily extract one 45-minute decision context from continuous EEG."""
+    """Lazily extract one decision context from continuous EEG.
+
+    The stored recordings are filtered but not standardized: there is a single
+    shared copy of the EEG behind every window/horizon combination, so the
+    per-channel affine scaler is applied here, to the sliced history, rather
+    than baked into a standardized duplicate on disk.  Because the scaler is
+    affine and per channel, scaling a slice is identical to slicing a scaled
+    recording.
+    """
 
     def __init__(
         self,
         examples: pd.DataFrame,
         config: PreprocessingConfig,
+        scaler_document: dict,
     ) -> None:
+        """
+        Build the dataset.
+
+        ``scaler_document`` is required rather than optional: the stored EEG
+        is in raw filtered units, so omitting it would silently train on
+        microvolts instead of standardized signal.  Get it from
+        `load_scaler_document`, which reads the document the manifest names.
+        """
         self.examples = examples.reset_index(drop=True)
         self.config = config
+        self.scaler_document = scaler_document
         self._signal_cache: dict[str, np.ndarray] = {}
         self._availability_cache: dict[str, np.ndarray] = {}
+        self._scaler_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
         self.chunk_samples = int(
             round(config.chunk_window_seconds * config.target_sfreq)
@@ -457,6 +546,21 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         )
         if self.history_samples % self.chunk_samples != 0:
             raise ValueError("The configured history must divide into whole chunks.")
+
+        expected_channels = list(config.canonical_channel_names)
+        if list(scaler_document["channel_names"]) != expected_channels:
+            raise ValueError(
+                "The scaler document channel order does not match the "
+                f"canonical order {expected_channels}; found "
+                f"{list(scaler_document['channel_names'])}."
+            )
+
+        for column in ("subject", "recording_id"):
+            if column not in self.examples.columns:
+                raise ValueError(
+                    "Standardizing on load needs the "
+                    f"{column!r} column to select each decision's scaler."
+                )
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -472,6 +576,31 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         if signal_path not in self._signal_cache:
             self._signal_cache[signal_path] = np.load(signal_path, mmap_mode="r")
         return self._signal_cache[signal_path]
+
+    def _center_and_scale(
+        self,
+        subject: str,
+        recording_id: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the per-channel center and scale for one recording."""
+        if recording_id not in self._scaler_cache:
+            scaler = select_scaler(
+                self.scaler_document,
+                subject=subject,
+                recording_id=recording_id,
+            )
+            center = scaler.get("center", scaler.get("mean"))
+            scale = scaler.get("scale", scaler.get("std"))
+            if center is None or scale is None:
+                raise ValueError(
+                    f"Scaler for {recording_id!r} is missing center/scale "
+                    "parameters."
+                )
+            self._scaler_cache[recording_id] = (
+                np.asarray(center, dtype=np.float32),
+                np.asarray(scale, dtype=np.float32),
+            )
+        return self._scaler_cache[recording_id]
 
     def _load_availability(self, availability_path: str) -> np.ndarray:
         if availability_path not in self._availability_cache:
@@ -499,8 +628,10 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
 
         if decision_end - history_start != self.history_samples:
             raise ValueError(
-                "Decision metadata does not contain the configured 45-minute "
-                "history length."
+                "Decision metadata does not contain the configured "
+                f"{self.config.input_window_seconds / 60.0:g}-minute history "
+                "length. The manifest was probably built for a different "
+                "input window than this config names."
             )
         if history_start < 0 or decision_end > signal.shape[1]:
             raise ValueError("Decision metadata indexes EEG outside the recording.")
@@ -509,6 +640,20 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
             signal[:, history_start:decision_end],
             dtype=np.float32,
         )
+
+        availability = self._load_availability(
+            str(row["channel_availability_path"])
+        )
+
+        center, scale = self._center_and_scale(
+            subject=str(row["subject"]),
+            recording_id=str(row["recording_id"]),
+        )
+        history = (history - center[:, None]) / scale[:, None]
+        # A channel the wearable did not record is stored as zeros; keep it at
+        # exactly zero rather than at the scaler's offset.
+        history[availability == 0.0, :] = 0.0
+
         chunks = np.ascontiguousarray(
             history.reshape(
                 len(self.config.canonical_channel_names),
@@ -519,9 +664,7 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
 
         return (
             torch.from_numpy(chunks),
-            torch.from_numpy(
-                self._load_availability(str(row["channel_availability_path"])).copy()
-            ),
+            torch.from_numpy(availability.copy()),
             torch.tensor(float(row["label"]), dtype=torch.float32),
         )
 
@@ -540,11 +683,12 @@ def embedding_cache_path(signal_path: str | Path, cache_root: Path) -> Path:
 class CachedEmbeddingDecisionDataset(
     Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 ):
-    """Read 45-minute contexts from cached continuous EEGNet embeddings.
+    """Read configured-window contexts from cached continuous EEGNet embeddings.
 
     Cache files contain one embedding per non-overlapping five-second chunk of
     a processed recording.  Decision histories therefore remain lazy and do
-    not duplicate the heavily overlapping 45-minute inputs.
+    not duplicate the heavily overlapping inputs of whichever window is
+    configured.
     """
 
     def __init__(
@@ -641,8 +785,10 @@ class CachedEmbeddingDecisionDataset(
         decision_end = int(row["decision_end_sample"])
         if decision_end - history_start != self.history_samples:
             raise ValueError(
-                "Decision metadata does not contain the configured 45-minute "
-                "history length."
+                "Decision metadata does not contain the configured "
+                f"{self.config.input_window_seconds / 60.0:g}-minute history "
+                "length. The manifest was probably built for a different "
+                "input window than this config names."
             )
         if (
             history_start < 0

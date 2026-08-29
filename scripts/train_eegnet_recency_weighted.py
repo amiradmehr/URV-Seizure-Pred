@@ -1,7 +1,8 @@
 r"""Train constrained minute-recency weights on the selected EEGNet baseline.
 
 The EEGNet encoder and the original classifier remain frozen. The only
-trainable values are one pooling logit for each minute of the 45-minute input.
+trainable values are one pooling logit for each minute of the configured
+input window.
 Softmax keeps the weights nonnegative and normalized, while a fixed uniform
 mixture and KL penalty keep the result close to the working mean-pool baseline.
 
@@ -44,7 +45,11 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     CachedEmbeddingDecisionDataset,
@@ -139,9 +144,7 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "embedding_cache"
+            CONFIG.embedding_cache_dir
             / "eegnet_baseline_ratio10_lr1e4"
         ),
     )
@@ -155,6 +158,7 @@ def parse_arguments() -> argparse.Namespace:
             / "eegnet_recency_weighted_ratio10"
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -216,6 +220,7 @@ def validate_embedding_cache(
     cache_dir: Path,
     checkpoint_path: Path,
     embedding_dim: int,
+    config,
 ) -> None:
     """Ensure cached embeddings came from this exact baseline encoder."""
     metadata_path = cache_dir / "cache_metadata.json"
@@ -232,7 +237,7 @@ def validate_embedding_cache(
     if int(metadata.get("embedding_dim", -1)) != embedding_dim:
         raise ValueError("The embedding cache has a different embedding dimension.")
     expected_chunk_samples = int(
-        round(CONFIG.chunk_window_seconds * CONFIG.target_sfreq)
+        round(config.chunk_window_seconds * config.target_sfreq)
     )
     if int(metadata.get("chunk_samples", -1)) != expected_chunk_samples:
         raise ValueError("The embedding cache uses an incompatible chunk size.")
@@ -263,6 +268,7 @@ def sampling_prior_logit_correction(
 def build_loader(
     examples,
     *,
+    config,
     cache_dir: Path,
     embedding_dim: int,
     batch_size: int,
@@ -270,10 +276,10 @@ def build_loader(
     device: torch.device,
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
-    """Build a loader over cached 45-minute embedding histories."""
+    """Build a loader over cached embedding histories for the configured window."""
     dataset = CachedEmbeddingDecisionDataset(
         examples,
-        CONFIG,
+        config,
         cache_root=cache_dir,
         embedding_dim=embedding_dim,
     )
@@ -618,7 +624,8 @@ def main() -> None:
     """Initialize from the best baseline and learn constrained recency."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
     if not arguments.baseline_checkpoint.exists():
@@ -639,9 +646,9 @@ def main() -> None:
     ):
         raise ValueError("The checkpoint does not contain a BaselineEEGNet model.")
 
-    chunk_seconds = CONFIG.chunk_window_seconds
+    chunk_seconds = config.chunk_window_seconds
     chunks_per_minute = int(round(60.0 / chunk_seconds))
-    sequence_chunks = int(round(CONFIG.input_window_seconds / chunk_seconds))
+    sequence_chunks = int(round(config.input_window_seconds / chunk_seconds))
     model_config = EEGNetRecencyWeightedConfig(
         n_chans=int(baseline_config["n_chans"]),
         chunk_samples=int(baseline_config["chunk_samples"]),
@@ -663,19 +670,22 @@ def main() -> None:
         arguments.cache_dir,
         arguments.baseline_checkpoint,
         model_config.embedding_dim,
+        config,
     )
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     train_sampler = BalancedEpochSampler(
         train_examples["label"],
@@ -684,6 +694,7 @@ def main() -> None:
     )
     train_loader = build_loader(
         train_examples,
+        config=config,
         cache_dir=arguments.cache_dir,
         embedding_dim=model_config.embedding_dim,
         batch_size=arguments.batch_size,
@@ -693,6 +704,7 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
+        config=config,
         cache_dir=arguments.cache_dir,
         embedding_dim=model_config.embedding_dim,
         batch_size=arguments.batch_size,

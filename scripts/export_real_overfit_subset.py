@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,10 +16,14 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG
+from seizure_prediction.config import (
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (
     StreamingDecisionDataset,
     load_decision_examples,
+    load_scaler_document,
 )
 
 
@@ -30,19 +35,32 @@ OUTPUT_TENSOR_PATH = OUTPUT_DIRECTORY / "real_overfit_subset.pt"
 OUTPUT_METADATA_PATH = OUTPUT_DIRECTORY / "real_overfit_subset_metadata.csv"
 
 
+def parse_arguments() -> argparse.Namespace:
+    """Parse the label definition to export a subset from."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_label_definition_arguments(parser)
+    return parser.parse_args()
+
+
 def main() -> None:
+    arguments = parse_arguments()
+    config = resolve_label_definition(arguments)
+    config.validate()
     rng = np.random.default_rng(SEED)
 
     manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "processed_shard_manifest.csv"
     )
+
+    scaler_document = load_scaler_document(manifest_path, config.project_root)
 
     examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=SEED,
+        project_root=config.project_root,
     )
 
     positives = examples[
@@ -118,21 +136,22 @@ def main() -> None:
 
     dataset = StreamingDecisionDataset(
         subset,
-        CONFIG,
+        config,
+        scaler_document,
     )
 
     sequence_chunks = int(
-        CONFIG.input_window_seconds
-        / CONFIG.chunk_window_seconds
+        config.input_window_seconds
+        / config.chunk_window_seconds
     )
 
     chunk_samples = int(
-        CONFIG.chunk_window_seconds
-        * CONFIG.target_sfreq
+        config.chunk_window_seconds
+        * config.target_sfreq
     )
 
     number_of_channels = len(
-        CONFIG.canonical_channel_names
+        config.canonical_channel_names
     )
 
     # Float16 makes the 40-example bundle approximately 160 MiB.

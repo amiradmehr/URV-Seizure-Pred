@@ -7,12 +7,17 @@ This module handles:
 2. Reading seizure annotations.
 3. Applying bandpass and notch filtering.
 4. Preserving the native 256-Hz EEG sampling rate.
-5. Creating indexed streaming decision points with 45-minute histories.
-6. Labeling seizure risk during the following 10 minutes.
+5. Creating indexed streaming decision points whose history length is the
+   configured input window.
+6. Labeling seizure risk during the following seizure occurrence period.
 7. Preserving local/cross seizure metadata when available.
 8. Splitting complete patients into train, validation, and test groups.
 9. Applying the channel scalers fitted by seizure_prediction.normalization,
    at global, per-patient, or per-recording scope.
+
+Only steps 5 and 6 depend on the label definition.  Filtering and scaler
+fitting are shared by every window/horizon combination, which is why the
+filtered EEG is written once and never duplicated per combination.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import pandas as pd
 from seizure_prediction.config import PreprocessingConfig
 from seizure_prediction.normalization import (
     apply_channel_scaler,
+    scaler_key_for,
     select_scaler,
 )
 
@@ -702,248 +708,6 @@ def intervals_overlap(
     )
 
 
-def label_window(
-    window_start_seconds: float,
-    window_stop_seconds: float,
-    seizure_events: pd.DataFrame,
-    config: PreprocessingConfig,
-) -> tuple[int | None, str, str | None, str]:
-    """
-    Label one candidate EEG window.
-
-    Returns
-    -------
-    label:
-        ``1`` for preictal, ``0`` for interictal, and ``None`` when the
-        window must be excluded.
-    label_name:
-        Human-readable label.
-    target_seizure_id:
-        Associated seizure ID for preictal windows.
-    seizure_scope:
-        ``local``, ``cross``, ``unknown``, or ``none``.
-
-    Positive interval
-    -----------------
-    For a 60-minute preictal window and 30-minute horizon:
-
-        onset - 90 minutes <= window <= onset - 30 minutes
-
-    Excluded intervals
-    ------------------
-    Windows are excluded when they overlap:
-
-    - the 30-minute prediction horizon;
-    - the seizure itself;
-    - the configured postictal period.
-    """
-    preictal_seconds = (
-        config.preictal_window_minutes * 60.0
-    )
-    horizon_seconds = (
-        config.prediction_horizon_minutes * 60.0
-    )
-    postictal_seconds = (
-        config.postictal_exclusion_minutes * 60.0
-    )
-
-    for _, seizure in seizure_events.iterrows():
-        onset = float(seizure["onset_seconds"])
-        duration = float(seizure["duration_seconds"])
-
-        preictal_start = (
-            onset
-            - horizon_seconds
-            - preictal_seconds
-        )
-        preictal_stop = onset - horizon_seconds
-
-        seizure_stop = onset + duration
-        exclusion_stop = seizure_stop + postictal_seconds
-
-        # Require the entire model window to lie inside the positive
-        # interval. This avoids ambiguous boundary windows.
-        if (
-            window_start_seconds >= preictal_start
-            and window_stop_seconds <= preictal_stop
-        ):
-            return (
-                1,
-                "preictal",
-                str(seizure["seizure_id"]),
-                str(seizure["seizure_scope"]),
-            )
-
-        # Exclude prediction-horizon, ictal, and postictal windows.
-        if intervals_overlap(
-            window_start_seconds,
-            window_stop_seconds,
-            preictal_stop,
-            exclusion_stop,
-        ):
-            return (
-                None,
-                "excluded_near_seizure",
-                None,
-                "none",
-            )
-
-    return 0, "interictal", None, "none"
-
-
-# ----------------------------------------------------------------------
-# Window generation
-# ----------------------------------------------------------------------
-
-
-def create_labeled_windows(
-    raw: mne.io.BaseRaw,
-    seizure_events: pd.DataFrame,
-    entities: dict[str, str],
-    bte_side: str,
-    config: PreprocessingConfig,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Convert one continuous EEG recording into labeled fixed-size windows.
-
-    Returns
-    -------
-    X:
-        EEG tensor with shape:
-
-            (n_windows, n_channels, n_samples)
-
-    metadata:
-        One row per EEG window.
-
-    bte_side:
-        Recorded behind-the-ear configuration: ``left``, ``right``, or
-        ``bilateral``.
-    """
-    sampling_frequency = float(raw.info["sfreq"])
-
-    window_samples = int(
-        round(
-            config.input_window_seconds
-            * sampling_frequency
-        )
-    )
-
-    stride_samples = int(
-        round(
-            config.input_stride_seconds
-            * sampling_frequency
-        )
-    )
-
-    if window_samples <= 0:
-        raise ValueError("Window sample count must be positive.")
-
-    if stride_samples <= 0:
-        raise ValueError("Stride sample count must be positive.")
-
-    expected_samples = int(
-        round(
-            config.input_window_seconds
-            * config.target_sfreq
-        )
-    )
-
-    if window_samples != expected_samples:
-        raise ValueError(
-            f"Expected {expected_samples} samples per window, "
-            f"but the recording produced {window_samples}."
-        )
-
-    recording_id = recording_id_from_entities(entities)
-
-    windows: list[np.ndarray] = []
-    metadata_rows: list[dict[str, Any]] = []
-
-    start_sample = 0
-    candidate_window_index = 0
-
-    while start_sample + window_samples <= raw.n_times:
-        stop_sample = start_sample + window_samples
-
-        window_start_seconds = start_sample / sampling_frequency
-        window_stop_seconds = stop_sample / sampling_frequency
-
-        (
-            label,
-            label_name,
-            target_seizure_id,
-            seizure_scope,
-        ) = label_window(
-            window_start_seconds=window_start_seconds,
-            window_stop_seconds=window_stop_seconds,
-            seizure_events=seizure_events,
-            config=config,
-        )
-
-        if label is not None:
-            window_data = raw.get_data(
-                start=start_sample,
-                stop=stop_sample,
-            ).astype(config.signal_dtype, copy=False)
-
-            if window_data.shape[-1] != expected_samples:
-                raise RuntimeError(
-                    "Generated window has an unexpected sample count: "
-                    f"{window_data.shape}"
-                )
-
-            if np.isfinite(window_data).all():
-                saved_window_index = len(windows)
-                windows.append(window_data)
-
-                metadata_rows.append(
-                    {
-                        "recording_id": recording_id,
-                        "window_index_in_shard": saved_window_index,
-                        "candidate_window_index": (
-                            candidate_window_index
-                        ),
-                        "subject": entities["subject"],
-                        "session": entities["session"],
-                        "task": entities["task"],
-                        "run": entities["run"],
-                        "bte_side": bte_side,
-                        "window_start_seconds": (
-                            window_start_seconds
-                        ),
-                        "window_stop_seconds": (
-                            window_stop_seconds
-                        ),
-                        "label": int(label),
-                        "label_name": label_name,
-                        "target_seizure_id": target_seizure_id,
-                        "seizure_scope": seizure_scope,
-                    }
-                )
-
-        start_sample += stride_samples
-        candidate_window_index += 1
-
-    metadata = pd.DataFrame(metadata_rows)
-
-    if not windows:
-        empty_shape = (
-            0,
-            len(raw.ch_names),
-            expected_samples,
-        )
-
-        return (
-            np.empty(
-                empty_shape,
-                dtype=config.signal_dtype,
-            ),
-            metadata,
-        )
-
-    return np.stack(windows), metadata
-
 
 def interval_has_bad_annotation(
     raw: mne.io.BaseRaw,
@@ -1077,12 +841,13 @@ def label_prediction_decision(
     eligible_seizure_ids: set[str],
     config: PreprocessingConfig,
 ) -> tuple[int | None, str, str | None, str]:
-    """Label one streaming decision for seizure onset in the next 10 minutes."""
+    """Label one streaming decision for seizure onset in the occurrence period."""
     horizon_seconds = config.prediction_horizon_minutes * 60.0
     occurrence_seconds = config.seizure_occurrence_period_minutes * 60.0
     postictal_seconds = config.postictal_exclusion_minutes * 60.0
     target_start = decision_time_seconds + horizon_seconds
     target_stop = target_start + occurrence_seconds
+    occurrence_label = f"{config.seizure_occurrence_period_minutes:g}m"
 
     for _, seizure in seizure_events.iterrows():
         onset = float(seizure["onset_seconds"])
@@ -1102,12 +867,12 @@ def label_prediction_decision(
 
             return (
                 1,
-                "seizure_within_10m",
+                f"seizure_within_{occurrence_label}",
                 seizure_id,
                 str(seizure["seizure_scope"]),
             )
 
-    return 0, "no_seizure_within_10m", None, "none"
+    return 0, f"no_seizure_within_{occurrence_label}", None, "none"
 
 
 def create_labeled_prediction_decisions(
@@ -1257,21 +1022,48 @@ def create_labeled_prediction_decisions(
 # ----------------------------------------------------------------------
 
 
-def save_unscaled_recording(
-    signal: np.ndarray,
-    decision_metadata: pd.DataFrame,
-    channel_names: list[str],
-    channel_availability: np.ndarray,
+def filtered_recording_paths(
     output_directory: Path,
     recording_id: str,
-) -> tuple[Path, Path]:
-    """Save one filtered continuous recording and its decision-time metadata."""
+) -> tuple[Path, Path, Path, Path]:
+    """Return the four files that make up one shared filtered recording."""
+    return (
+        output_directory / f"{recording_id}.npy",
+        output_directory / f"{recording_id}_channels.json",
+        output_directory / f"{recording_id}_channel_availability.json",
+        output_directory / f"{recording_id}_recording.json",
+    )
+
+
+def save_filtered_recording(
+    raw: mne.io.BaseRaw,
+    channel_availability: np.ndarray,
+    bte_side: str,
+    output_directory: Path,
+    recording_id: str,
+    output_dtype: str,
+) -> Path:
+    """
+    Save one filtered continuous recording to the shared cache.
+
+    Everything needed to relabel this recording under a different input
+    window or seizure occurrence period is stored alongside the signal --
+    channel order, the availability mask, the sampling rate, the inferred
+    behind-the-ear side, and the annotations that mark unusable intervals.
+    A later build can therefore produce a new label definition without
+    reopening and refiltering the EDF, which is the slow part of the
+    pipeline and the reason this cache is never written per combination.
+    """
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    array_path = output_directory / f"{recording_id}.npy"
-    metadata_path = output_directory / f"{recording_id}.csv"
-    channels_path = output_directory / f"{recording_id}_channels.json"
-    availability_path = output_directory / f"{recording_id}_channel_availability.json"
+    (
+        array_path,
+        channels_path,
+        availability_path,
+        recording_path,
+    ) = filtered_recording_paths(output_directory, recording_id)
+
+    signal = raw.get_data().astype(output_dtype, copy=False)
 
     if signal.ndim != 2:
         raise ValueError(
@@ -1291,21 +1083,130 @@ def save_unscaled_recording(
 
     np.save(array_path, signal)
 
-    decision_metadata.to_csv(
-        metadata_path,
-        index=False,
-    )
-
-    with channels_path.open(
-        "w",
-        encoding="utf-8",
-    ) as channel_file:
-        json.dump(channel_names, channel_file, indent=2)
+    with channels_path.open("w", encoding="utf-8") as channel_file:
+        json.dump(list(raw.ch_names), channel_file, indent=2)
 
     with availability_path.open("w", encoding="utf-8") as availability_file:
         json.dump(availability.astype(int).tolist(), availability_file, indent=2)
 
-    return array_path, metadata_path
+    with recording_path.open("w", encoding="utf-8") as recording_file:
+        json.dump(
+            {
+                "recording_id": recording_id,
+                "sampling_frequency_hz": float(raw.info["sfreq"]),
+                "number_of_samples": int(signal.shape[1]),
+                "bte_side": bte_side,
+                "annotations": [
+                    {
+                        "onset_seconds": float(onset),
+                        "duration_seconds": float(duration),
+                        "description": str(description),
+                    }
+                    for onset, duration, description in zip(
+                        raw.annotations.onset,
+                        raw.annotations.duration,
+                        raw.annotations.description,
+                    )
+                ],
+            },
+            recording_file,
+            indent=2,
+        )
+
+    return array_path
+
+
+def load_filtered_recording(
+    output_directory: Path,
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> tuple[mne.io.BaseRaw, str, np.ndarray] | None:
+    """
+    Rebuild a cached filtered recording, or return ``None`` if unusable.
+
+    The returned object behaves like the output of ``filter_and_prepare`` --
+    same channel order, sampling rate, and annotations -- so decision
+    labeling cannot tell a cache hit from a fresh filter pass.  Anything
+    inconsistent returns ``None`` so the caller refilters from the EDF rather
+    than labeling against a partially written file.
+    """
+    (
+        array_path,
+        channels_path,
+        availability_path,
+        recording_path,
+    ) = filtered_recording_paths(output_directory, recording_id)
+
+    paths = (array_path, channels_path, availability_path, recording_path)
+
+    if not all(path.exists() for path in paths):
+        return None
+
+    try:
+        with channels_path.open("r", encoding="utf-8") as channel_file:
+            channel_names = json.load(channel_file)
+
+        if channel_names != list(config.canonical_channel_names):
+            raise ValueError(f"unexpected channel layout {channel_names}")
+
+        with availability_path.open("r", encoding="utf-8") as availability_file:
+            availability = np.asarray(json.load(availability_file), dtype=bool)
+
+        if availability.shape != (len(config.canonical_channel_names),):
+            raise ValueError(
+                f"invalid availability mask {availability.tolist()}"
+            )
+
+        if not availability.any():
+            raise ValueError("cached recording has no available EEG channel")
+
+        with recording_path.open("r", encoding="utf-8") as recording_file:
+            recording_document = json.load(recording_file)
+
+        sampling_frequency = float(recording_document["sampling_frequency_hz"])
+
+        if not np.isclose(sampling_frequency, config.target_sfreq):
+            raise ValueError(
+                "cached sampling frequency "
+                f"{sampling_frequency} does not match {config.target_sfreq}"
+            )
+
+        signal = np.load(array_path, mmap_mode="r")
+
+        if signal.ndim != 2 or signal.shape[0] != len(channel_names):
+            raise ValueError(f"unexpected signal shape {signal.shape}")
+
+        if signal.shape[1] != int(recording_document["number_of_samples"]):
+            raise ValueError(
+                "cached signal length does not match its recording document; "
+                "the file is probably truncated"
+            )
+
+        raw = mne.io.RawArray(
+            np.asarray(signal, dtype=np.float64),
+            mne.create_info(
+                ch_names=list(channel_names),
+                sfreq=sampling_frequency,
+                ch_types="eeg",
+            ),
+            verbose="ERROR",
+        )
+
+        annotations = recording_document["annotations"]
+
+        if annotations:
+            raw.set_annotations(
+                mne.Annotations(
+                    onset=[item["onset_seconds"] for item in annotations],
+                    duration=[item["duration_seconds"] for item in annotations],
+                    description=[item["description"] for item in annotations],
+                ),
+                verbose="ERROR",
+            )
+
+        return raw, str(recording_document["bte_side"]), availability
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, EOFError):
+        return None
 
 
 def load_channel_names_for_shard(
@@ -1811,20 +1712,34 @@ def apply_global_channel_zscore(
 # ----------------------------------------------------------------------
 
 
-def write_standardized_shards(
+def write_decision_shards(
     metadata: pd.DataFrame,
     unscaled_recordings_dir: Path,
     processed_data_dir: Path,
     scaler_document: dict[str, Any],
-    output_dtype: str,
+    scaler_document_path: Path,
+    project_root: Path,
 ) -> pd.DataFrame:
     """
-    Standardize every continuous recording and save its decision metadata.
+    Save each recording's decision labels and metadata for one label definition.
 
-    Each recording belongs to exactly one patient-level split.  The scaler that
-    standardizes a recording is chosen from ``scaler_document`` according to its
-    normalization mode, so the same routine serves global, per-patient, and
-    per-recording scaling.
+    No EEG is written.  Every shard points back at the single shared filtered
+    recording in ``unscaled_recordings_dir``, and standardization happens when
+    a decision is loaded: it is a per-channel affine map, so scaling a sliced
+    history is identical to slicing a scaled recording.  Twelve label
+    definitions therefore cost twelve sets of labels rather than twelve copies
+    of the EEG.
+
+    The scaler that standardizes a recording is named per shard from
+    ``scaler_document`` according to its normalization mode, so the same
+    routine serves global, per-patient, and per-recording scaling.  Each row
+    also records where that document lives, which makes the manifest
+    self-describing: a consumer can standardize the recordings it references
+    without being told separately which normalization the build used.
+
+    Each recording belongs to exactly one patient-level split.  Paths are
+    stored relative to ``project_root`` so the tree can be moved or copied to
+    another machine without rewriting the manifest.
     """
     manifest_rows: list[dict[str, Any]] = []
     normalization_mode = scaler_document["normalization_mode"]
@@ -1838,10 +1753,11 @@ def write_standardized_shards(
             / f"{recording_id}.npy"
         )
 
-        X = np.load(
-            array_path,
-            mmap_mode="r",
-        )
+        if not array_path.exists():
+            raise ValueError(
+                f"Recording {recording_id} has decisions but no filtered "
+                f"recording at {array_path}."
+            )
 
         channel_names = load_channel_names_for_shard(
             array_path
@@ -1850,6 +1766,19 @@ def write_standardized_shards(
 
         subject = normalize_entity(
             recording_metadata["subject"].iloc[0]
+        )
+
+        # Resolve the scaler now so a missing one fails during the build
+        # rather than in the middle of a training epoch.
+        scaler_key = scaler_key_for(
+            normalization_mode,
+            subject=subject,
+            recording_id=str(recording_id),
+        )
+        select_scaler(
+            scaler_document,
+            subject=subject,
+            recording_id=str(recording_id),
         )
 
         if recording_metadata["split"].nunique() != 1:
@@ -1869,24 +1798,6 @@ def write_standardized_shards(
 
             if split_rows.empty:
                 continue
-
-            X_split_unscaled = np.asarray(
-                X,
-                dtype=np.float32,
-            )
-
-            X_split = apply_channel_scaler(
-                X=X_split_unscaled,
-                channel_names=channel_names,
-                channel_availability=channel_availability,
-                scaler=select_scaler(
-                    scaler_document,
-                    subject=subject,
-                    recording_id=str(recording_id),
-                ),
-                document=scaler_document,
-                output_dtype=output_dtype,
-            )
 
             y_split = split_rows[
                 "label"
@@ -1917,11 +1828,6 @@ def write_standardized_shards(
                 exist_ok=True,
             )
 
-            X_path = (
-                split_directory
-                / f"{shard_name}_X.npy"
-            )
-
             y_path = (
                 split_directory
                 / f"{shard_name}_y.npy"
@@ -1941,7 +1847,6 @@ def write_standardized_shards(
                 / f"{shard_name}_channel_availability.json"
             )
 
-            np.save(X_path, X_split)
             np.save(y_path, y_split)
 
             split_rows.to_csv(
@@ -1975,6 +1880,11 @@ def write_standardized_shards(
                     "subject": subject,
                     "split": split_name,
                     "normalization_mode": normalization_mode,
+                    "scaler_key": scaler_key,
+                    "scaler_document_path": relative_to_project_root(
+                        scaler_document_path,
+                        project_root,
+                    ),
                     "number_of_decisions": len(y_split),
                     "number_of_positive_decisions": int(
                         np.sum(y_split == 1)
@@ -1982,15 +1892,26 @@ def write_standardized_shards(
                     "number_of_negative_decisions": int(
                         np.sum(y_split == 0)
                     ),
-                    "X_path": str(X_path),
-                    "y_path": str(y_path),
-                    "metadata_path": str(
-                        metadata_path
+                    "X_path": relative_to_project_root(
+                        array_path,
+                        project_root,
                     ),
-                    "channels_path": str(
-                        channels_path
+                    "y_path": relative_to_project_root(
+                        y_path,
+                        project_root,
                     ),
-                    "channel_availability_path": str(availability_path),
+                    "metadata_path": relative_to_project_root(
+                        metadata_path,
+                        project_root,
+                    ),
+                    "channels_path": relative_to_project_root(
+                        channels_path,
+                        project_root,
+                    ),
+                    "channel_availability_path": relative_to_project_root(
+                        availability_path,
+                        project_root,
+                    ),
                 }
             )
 
@@ -2002,6 +1923,25 @@ def write_standardized_shards(
 # ----------------------------------------------------------------------
 
 
+def relative_to_project_root(
+    path: Path,
+    project_root: Path,
+) -> str:
+    """
+    Return ``path`` written relative to ``project_root`` where possible.
+
+    Manifests record where the shared filtered recordings live.  Storing that
+    relative to the project root lets the whole data tree be copied to another
+    machine -- a training box, or Colab -- without rewriting every row.  A
+    path outside the project root is returned absolute, since there is no
+    relative form that would survive the move anyway.
+    """
+    try:
+        return str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
 def clear_generated_directory(
     directory: Path,
 ) -> None:
@@ -2010,11 +1950,25 @@ def clear_generated_directory(
 
     This prevents stale shards from an older preprocessing run from being
     mixed with new output.
-    """
-    if directory.exists():
-        shutil.rmtree(directory)
 
-    directory.mkdir(
+    Refuses to touch anything under an ``interim/_shared`` tree.  That tree
+    holds the single copy of the filtered EEG behind every label definition,
+    and rebuilding it costs hours of EDF decoding, so a tagged build clearing
+    its own output must never reach it.
+    """
+    resolved = directory.resolve()
+
+    if "_shared" in resolved.parts:
+        raise ValueError(
+            "Refusing to clear the shared preprocessing cache at "
+            f"{resolved}. Filtered recordings and fitted scalers are reused "
+            "by every label definition and are never rebuilt by a tagged run."
+        )
+
+    if resolved.exists():
+        shutil.rmtree(resolved)
+
+    resolved.mkdir(
         parents=True,
         exist_ok=True,
     )

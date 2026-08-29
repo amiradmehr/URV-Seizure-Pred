@@ -12,7 +12,7 @@ from torch.nn import functional as F
 
 @dataclass(frozen=True)
 class EEGNetMeanPoolConfig:
-    """Configuration for the 45-minute EEGNet mean-pooling baseline."""
+    """Configuration for the EEGNet mean-pooling baseline."""
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
@@ -23,7 +23,7 @@ class EEGNetMeanPoolConfig:
 
 
 class EEGNetMeanPoolRiskModel(nn.Module):
-    """Encode five-second EEG chunks with EEGNet and mean-pool over 45 minutes.
+    """Encode five-second EEG chunks with EEGNet and mean-pool over the input window.
 
     The input contains a full streaming decision context with shape
     ``(batch, chunks, channels, samples)``. Each chunk is encoded by the
@@ -62,7 +62,7 @@ class EEGNetMeanPoolRiskModel(nn.Module):
         )
 
     def _encode_chunks(self, chunks: torch.Tensor) -> torch.Tensor:
-        """Encode chunks in micro-batches to keep 45-minute contexts tractable."""
+        """Encode chunks in micro-batches to keep long contexts tractable."""
         embeddings = []
         for chunk_batch in chunks.split(self.config.encoder_chunk_batch_size):
             embeddings.append(self.encoder(chunk_batch))
@@ -73,7 +73,7 @@ class EEGNetMeanPoolRiskModel(nn.Module):
         signal: torch.Tensor,
         channel_availability: torch.Tensor,
     ) -> torch.Tensor:
-        """Return one uncalibrated seizure-risk logit per 45-minute context."""
+        """Return one uncalibrated seizure-risk logit per decision context."""
         if signal.ndim != 4:
             raise ValueError(
                 "signal must have shape (batch, chunks, channels, samples); "
@@ -140,7 +140,9 @@ class EEGNetTemporalTCNConfig:
 
     n_chans: int = 3
     chunk_samples: int = 5 * 256
-    sequence_chunks: int = 45 * 60 // 5
+    # The default matches the widest swept input window; the training script
+    # derives this from the label definition it was asked for.
+    sequence_chunks: int = 30 * 60 // 5
     embedding_dim: int = 32
     tcn_channels: int = 16
     tcn_kernel_size: int = 3
@@ -194,7 +196,7 @@ class CausalDepthwiseTCNBlock(nn.Module):
 
 
 class EEGNetTemporalTCNRiskModel(nn.Module):
-    """Combine local EEGNet features with ordered 45-minute TCN context.
+    """Combine local EEGNet features with ordered, configured-window TCN context.
 
     EEGNet independently encodes each five-second chunk. The embeddings retain
     their chronological order and are projected into a causal, dilated,
@@ -276,7 +278,7 @@ class EEGNetTemporalTCNRiskModel(nn.Module):
         signal: torch.Tensor,
         channel_availability: torch.Tensor,
     ) -> torch.Tensor:
-        """Return one uncalibrated seizure-risk logit per 45-minute context."""
+        """Return one uncalibrated seizure-risk logit per decision context."""
         if signal.ndim != 4:
             raise ValueError(
                 "signal must have shape (batch, chunks, channels, samples); "

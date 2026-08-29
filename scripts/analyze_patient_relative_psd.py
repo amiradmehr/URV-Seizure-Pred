@@ -26,7 +26,11 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from seizure_prediction.config import CONFIG
+from seizure_prediction.config import (
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.patient_relative_psd import (
     BANDS_HZ,
     compute_band_power_density,
@@ -69,15 +73,17 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    # Resolved once the label definition is known, since the manifests live
+    # under its tag. The recordings are shared, so that default is stable.
     parser.add_argument(
         "--decision-manifest",
         type=Path,
-        default=CONFIG.manifests_dir / "decision_manifest.csv",
+        default=None,
     )
     parser.add_argument(
         "--seizure-manifest",
         type=Path,
-        default=CONFIG.manifests_dir / "seizure_manifest.csv",
+        default=None,
     )
     parser.add_argument(
         "--recordings-dir",
@@ -94,6 +100,7 @@ def parse_arguments() -> argparse.Namespace:
             / "patient_relative_psd_train_validation"
         ),
     )
+    add_label_definition_arguments(parser)
     arguments = parser.parse_args()
     if arguments.preictal_minutes <= 0 or arguments.bin_minutes <= 0:
         parser.error("Preictal and bin durations must be positive.")
@@ -523,6 +530,18 @@ def plot_cohort_broadband(summary: pd.DataFrame, output_path: Path) -> None:
 
 def main() -> None:
     arguments = parse_arguments()
+    config = resolve_label_definition(arguments)
+    config.validate()
+
+    if arguments.decision_manifest is None:
+        arguments.decision_manifest = (
+            config.manifests_dir / "decision_manifest.csv"
+        )
+    if arguments.seizure_manifest is None:
+        arguments.seizure_manifest = (
+            config.manifests_dir / "seizure_manifest.csv"
+        )
+
     splits = tuple(dict.fromkeys(arguments.splits))
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
     patient_plot_dir = arguments.output_dir / "patients"
