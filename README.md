@@ -54,6 +54,12 @@ optional sanity-checking; steps 4+ you'll repeat per experiment.
 .venv/bin/python scripts/evaluate_eegnet_events.py --window-minutes 15 --horizon-minutes 5 --device cuda
 ```
 
+`--device` accepts `auto`, `cpu`, `cuda`, or `mps`. On Apple Silicon (no CUDA support), pass
+`--device mps` — or just leave `--device auto`, which now prefers CUDA, then MPS, then CPU. Every
+script above that trains, caches, or evaluates a model has this flag; `build_dataset.py` and
+`validate_dataset.py` don't need one, since they only touch the CPU-bound filtering/labeling
+pipeline.
+
 `--window-minutes`/`--horizon-minutes` appear on every script from step 3 onward and select which
 of the 12 label definitions to use; they default to 30/10 when omitted. Step 2 only needs to run
 once — it builds all 12 combinations together — so to try a different combination you repeat
@@ -172,7 +178,7 @@ selection is validation average precision.
 | `--gradient-accumulation-steps` | Accumulate small GPU batches into a larger effective batch. |
 | `--max-grad-norm` | Gradient clipping threshold. |
 | `--early-stopping-patience` | Stop after this many epochs without a better validation AP. |
-| `--num-workers`, `--seed`, `--device {auto,cpu,cuda}` | Standard runtime knobs. |
+| `--num-workers`, `--seed`, `--device {auto,cpu,cuda,mps}` | Standard runtime knobs (see the device note above). |
 | `--output-dir` | Defaults to `outputs/models/eegnet_baseline/<tag>/`. Use a distinct directory per experiment if you want to keep more than one run around. |
 | `--window-minutes`, `--horizon-minutes` | Which label definition to train on (default 30/10). |
 
@@ -198,7 +204,7 @@ temporal head.**
 | `--storage-dtype {float16,float32}` | Precision the cache is stored at on disk. |
 | `--amp` / `--no-amp` | CUDA mixed precision while encoding. Off by default so the cache matches float32 baseline evaluation exactly. |
 | `--overwrite` | Recompute and replace an existing cache rather than skipping it. |
-| `--device {auto,cpu,cuda}` | Runtime device. |
+| `--device {auto,cpu,cuda,mps}` | Runtime device (see the device note above). |
 | `--window-minutes`, `--horizon-minutes` | Which label definition's decisions to cache embeddings for (the cache itself is shared, but decision coverage depends on which manifests exist). |
 
 ### `train_eegnet_multiscale_temporal.py`
@@ -220,7 +226,7 @@ the head is zero-initialized so epoch 0 exactly reproduces the baseline. Require
 | `--negative-to-positive-ratio` | Training negatives sampled per positive each epoch. |
 | `--max-grad-norm` | Gradient clipping threshold. |
 | `--early-stopping-patience` | Stop after this many epochs without a better validation AP. |
-| `--num-workers`, `--seed`, `--device` | Standard runtime knobs. |
+| `--num-workers`, `--seed`, `--device {auto,cpu,cuda,mps}` | Standard runtime knobs (see the device note above). |
 | `--baseline-checkpoint` | Which trained baseline to freeze and build on top of. |
 | `--cache-dir` | Where the embedding cache lives. |
 | `--output-dir` | Output directory for this run. |
@@ -243,7 +249,7 @@ unless the data clearly wants otherwise. Also requires `cache_eegnet_embeddings.
 | `--max-temporal-strength` | Maximum fraction of weight assigned to the learned (rather than uniform) minute weights. |
 | `--softmax-temperature` | Temperature of the softmax over minute logits. |
 | `--minimum-ap-improvement` | Minimum validation-AP gain required to replace the saved checkpoint (guards against noise-driven "improvements"). |
-| `--negative-to-positive-ratio`, `--max-grad-norm`, `--early-stopping-patience`, `--epochs`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--num-workers`, `--seed`, `--device` | Same meaning as above. |
+| `--negative-to-positive-ratio`, `--max-grad-norm`, `--early-stopping-patience`, `--epochs`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--num-workers`, `--seed`, `--device {auto,cpu,cuda,mps}` | Same meaning as above (see the device note above). |
 | `--baseline-checkpoint`, `--cache-dir`, `--output-dir` | Same meaning as above. |
 | `--window-minutes`, `--horizon-minutes` | Which label definition to train on. |
 
@@ -267,7 +273,7 @@ touches the held-out test split.
 | `--reported-false-alarm-budgets` | Additional false-alarm budgets to report sensitivity at. |
 | `--target-sensitivities` | Sensitivities to report the false-alarm cost of. |
 | `--bootstrap-samples`, `--seed` | Bootstrap resampling controls. |
-| `--batch-size`, `--num-workers`, `--device` | Standard runtime knobs. |
+| `--batch-size`, `--num-workers`, `--device {auto,cpu,cuda,mps}` | Standard runtime knobs (see the device note above). |
 | `--checkpoint` | Which trained model to evaluate (baseline or a temporal head). |
 | `--cache-dir` | Embedding cache location, if the checkpoint being evaluated needs one. |
 | `--output-dir` | Where to write the evaluation report. |

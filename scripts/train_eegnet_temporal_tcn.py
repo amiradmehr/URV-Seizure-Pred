@@ -105,7 +105,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument(
@@ -129,17 +129,27 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select the requested training device with a clear CUDA failure."""
+    """Select the requested training device, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested, but no CUDA device is available.")
         return torch.device("cuda")
+    if requested_device == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested, but no MPS device is available.")
+        return torch.device("mps")
     if requested_device == "cpu":
         return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def build_loader(

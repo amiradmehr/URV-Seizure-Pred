@@ -99,7 +99,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument(
@@ -164,14 +164,22 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select CUDA when available unless CPU was explicitly requested."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
@@ -651,6 +659,8 @@ def main() -> None:
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
     print(json.dumps(counts, indent=2))
     print(
         "Parameters: "

@@ -101,7 +101,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     add_label_definition_arguments(parser)
@@ -109,11 +109,17 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select the requested accelerator and fail clearly when CUDA is absent."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
@@ -305,6 +311,8 @@ def main() -> None:
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
     print(f"Recordings to cache: {len(unique_recordings)}")
     print(f"Cache directory: {arguments.cache_dir.resolve()}")
     print(f"Storage dtype: {storage_dtype}; AMP encoding: {amp_enabled}")
