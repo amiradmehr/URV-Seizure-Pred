@@ -16,6 +16,7 @@ build/
 dist/
 
 # Raw and generated EEG data
+data/
 data/raw/
 data/interim/
 data/processed/

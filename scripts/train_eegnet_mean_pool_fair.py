@@ -38,7 +38,10 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     load_decision_examples,
@@ -106,6 +109,7 @@ def parse_arguments() -> argparse.Namespace:
             / "eegnet_mean_pool_ratio10_prior_corrected"
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -215,12 +219,13 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
 def main() -> None:
     """Train and checkpoint the fair EEGNet mean-pooling comparison."""
     arguments = parse_arguments()
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     validate_arguments(arguments)
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Processed manifest not found: {manifest_path}. "
@@ -232,12 +237,14 @@ def main() -> None:
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     train_sampler = BalancedEpochSampler(
         all_train_examples["label"],
@@ -270,8 +277,8 @@ def main() -> None:
     )
 
     model_config = EEGNetMeanPoolConfig(
-        n_chans=len(CONFIG.canonical_channel_names),
-        chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+        n_chans=len(config.canonical_channel_names),
+        chunk_samples=int(config.chunk_window_seconds * config.target_sfreq),
         embedding_dim=arguments.embedding_dim,
         encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
         dropout=arguments.dropout,
@@ -403,14 +410,14 @@ def main() -> None:
                     "model_state_dict": model.state_dict(),
                     "model_config": asdict(model_config),
                     "config": {
-                        "target_sfreq": CONFIG.target_sfreq,
-                        "input_window_seconds": CONFIG.input_window_seconds,
-                        "chunk_window_seconds": CONFIG.chunk_window_seconds,
+                        "target_sfreq": config.target_sfreq,
+                        "input_window_seconds": config.input_window_seconds,
+                        "chunk_window_seconds": config.chunk_window_seconds,
                         "canonical_channel_names": list(
-                            CONFIG.canonical_channel_names
+                            config.canonical_channel_names
                         ),
                         "seizure_occurrence_period_minutes": (
-                            CONFIG.seizure_occurrence_period_minutes
+                            config.seizure_occurrence_period_minutes
                         ),
                     },
                     "training_arguments": vars(arguments),

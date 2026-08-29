@@ -2,7 +2,7 @@ r"""Train and event-evaluate a feature-only AVA-style risk baseline.
 
 The representation contains no learned EEG encoder. A regularized logistic
 regression receives robust minute-level handcrafted features summarized across
-the same 45-minute histories used by EEGNet. Training exposure uses the same
+the same configured input-window histories used by EEGNet. Training exposure uses the same
 patient/event-balanced sampler as the current best EEGNet experiment, while
 validation remains complete, patient-held-out, and at natural prevalence.
 """
@@ -41,7 +41,11 @@ from evaluate_eegnet_events import (  # noqa: E402
     select_for_target_sensitivity,
     validate_positive_timing,
 )
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     PatientEventBalancedEpochSampler,
     load_decision_examples,
@@ -66,9 +70,7 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "handcrafted_feature_cache"
+            CONFIG.handcrafted_feature_cache_dir
             / "ava_minute_selected_v1"
         ),
     )
@@ -109,6 +111,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -211,7 +214,8 @@ def save_operating_curve(
 def main() -> None:
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     random.seed(arguments.seed)
     np.random.seed(arguments.seed)
     cache_metadata_path = arguments.cache_dir / "cache_metadata.json"
@@ -225,18 +229,20 @@ def main() -> None:
     if not {"train", "validation"}.issubset(cached_splits):
         raise ValueError("Feature cache must contain train and validation splits.")
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     sampler = PatientEventBalancedEpochSampler(
         train_examples,
@@ -257,12 +263,21 @@ def main() -> None:
     print(f"Sampled training decisions: {len(sampled_examples):,}")
     print(f"Validation decisions: {len(validation_examples):,}")
     print("Building sampled training feature matrix...")
-    train_features = build_decision_feature_matrix(sampled_examples, arguments.cache_dir)
+    history_minutes = int(round(config.input_window_seconds / 60.0))
+    train_features = build_decision_feature_matrix(
+        sampled_examples,
+        arguments.cache_dir,
+        sampling_frequency=config.target_sfreq,
+        history_minutes=history_minutes,
+    )
     print("Building complete validation feature matrix...")
     validation_features = build_decision_feature_matrix(
-        validation_examples, arguments.cache_dir
+        validation_examples,
+        arguments.cache_dir,
+        sampling_frequency=config.target_sfreq,
+        history_minutes=history_minutes,
     )
-    names = decision_feature_names(CONFIG.canonical_channel_names)
+    names = decision_feature_names(config.canonical_channel_names)
     if train_features.shape[1] != len(names):
         raise RuntimeError("Feature matrix width does not match feature names.")
 
@@ -334,7 +349,7 @@ def main() -> None:
         .astype(str)
     )
     seizure_manifest = pd.read_csv(
-        CONFIG.manifests_dir / "seizure_manifest.csv",
+        config.manifests_dir / "seizure_manifest.csv",
         dtype={"subject": str},
     )
     target_seizures = prepare_target_seizures(seizure_manifest, target_ids)
@@ -342,8 +357,8 @@ def main() -> None:
     thresholds = threshold_grid(
         predictions["probability"], arguments.number_of_thresholds
     )
-    horizon_seconds = CONFIG.prediction_horizon_minutes * 60.0
-    occurrence_seconds = CONFIG.seizure_occurrence_period_minutes * 60.0
+    horizon_seconds = config.prediction_horizon_minutes * 60.0
+    occurrence_seconds = config.seizure_occurrence_period_minutes * 60.0
     refractory_seconds = arguments.refractory_minutes * 60.0
     print(f"Sweeping {len(thresholds)} event thresholds...")
     sweep_rows: list[dict[str, float | int]] = []
@@ -355,7 +370,7 @@ def main() -> None:
             prediction_horizon_seconds=horizon_seconds,
             occurrence_period_seconds=occurrence_seconds,
             refractory_seconds=refractory_seconds,
-            decision_stride_seconds=CONFIG.input_stride_seconds,
+            decision_stride_seconds=config.input_stride_seconds,
         )
         sweep_rows.append(result.metrics)
         if index % 25 == 0 or index == len(thresholds):
@@ -373,7 +388,7 @@ def main() -> None:
         prediction_horizon_seconds=horizon_seconds,
         occurrence_period_seconds=occurrence_seconds,
         refractory_seconds=refractory_seconds,
-        decision_stride_seconds=CONFIG.input_stride_seconds,
+        decision_stride_seconds=config.input_stride_seconds,
     )
     bootstrap_intervals = bootstrap_patient_metrics(
         selected_evaluation.per_subject,
@@ -421,7 +436,7 @@ def main() -> None:
         "representation": {
             "minute_feature_names": list(FEATURE_NAMES),
             "history_summary_names": list(SUMMARY_NAMES),
-            "history_minutes": 45,
+            "history_minutes": history_minutes,
             "recent_and_early_minutes": 5,
             "classifier_features": len(names),
             "learned_raw_eeg_encoder": False,
@@ -454,8 +469,8 @@ def main() -> None:
             "binary_cross_entropy": validation_loss,
         },
         "alarm_definition": {
-            "prediction_horizon_minutes": CONFIG.prediction_horizon_minutes,
-            "occurrence_period_minutes": CONFIG.seizure_occurrence_period_minutes,
+            "prediction_horizon_minutes": config.prediction_horizon_minutes,
+            "occurrence_period_minutes": config.seizure_occurrence_period_minutes,
             "refractory_minutes": arguments.refractory_minutes,
             "false_alarm_denominator": (
                 "valid negative-decision exposure at the configured stride"

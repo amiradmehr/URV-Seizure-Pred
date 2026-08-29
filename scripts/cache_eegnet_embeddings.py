@@ -1,8 +1,8 @@
 r"""Cache continuous five-second EEGNet embeddings for temporal experiments.
 
 The processed recordings stay unchanged.  Each cache file stores one compact
-embedding per non-overlapping five-second chunk, so overlapping 45-minute
-decision histories can reuse the same encoder output.  This makes temporal-head
+embedding per non-overlapping five-second chunk, so overlapping
+decision histories of any configured length can reuse the same encoder output.  This makes temporal-head
 training practical on a local GPU without creating a materialized window copy.
 
 PowerShell example:
@@ -30,10 +30,19 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     embedding_cache_path,
+    load_scaler_document,
     resolve_stored_path,
+)
+from seizure_prediction.normalization import (  # noqa: E402
+    apply_channel_scaler,
+    select_scaler,
 )
 from seizure_prediction.models import (  # noqa: E402
     BaselineEEGNet,
@@ -59,10 +68,13 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "embedding_cache"
+            CONFIG.embedding_cache_dir
             / "eegnet_baseline_ratio10_lr1e4"
+        ),
+        help=(
+            "One embedding per five-second chunk of a whole recording, so the "
+            "cache does not depend on the input window or horizon and is "
+            "shared by every label definition."
         ),
     )
     parser.add_argument(
@@ -89,18 +101,25 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select the requested accelerator and fail clearly when CUDA is absent."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
@@ -162,8 +181,19 @@ def encode_recording(
     storage_dtype: np.dtype,
     amp_enabled: bool,
     overwrite: bool,
+    channel_names: list[str],
+    channel_availability: np.ndarray,
+    scaler: dict,
+    scaler_document: dict,
 ) -> tuple[int, bool]:
-    """Encode one continuous recording and atomically publish its cache."""
+    """Encode one continuous recording and atomically publish its cache.
+
+    The stored recording is filtered but not standardized, so each batch is
+    standardized here with the same per-channel affine map the training
+    loader applies. Scaling a slice equals slicing a scaled recording, so the
+    cached embeddings match what the model would see reading the recording
+    whole.
+    """
     signal = np.load(signal_path, mmap_mode="r")
     expected_channels = model.config.n_chans
     if signal.ndim != 2 or signal.shape[0] != expected_channels:
@@ -203,9 +233,16 @@ def encode_recording(
                 end_chunk = min(start_chunk + chunk_batch_size, number_of_chunks)
                 start_sample = start_chunk * chunk_samples
                 end_sample = end_chunk * chunk_samples
-                signal_batch = np.asarray(
-                    signal[:, start_sample:end_sample],
-                    dtype=np.float32,
+                signal_batch = apply_channel_scaler(
+                    X=np.asarray(
+                        signal[:, start_sample:end_sample],
+                        dtype=np.float32,
+                    ),
+                    channel_names=channel_names,
+                    channel_availability=channel_availability,
+                    scaler=scaler,
+                    document=scaler_document,
+                    output_dtype="float32",
                 ).reshape(
                     expected_channels,
                     end_chunk - start_chunk,
@@ -245,17 +282,22 @@ def main() -> None:
     arguments = parse_arguments()
     if arguments.chunk_batch_size <= 0:
         raise ValueError("chunk-batch-size must be positive.")
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     device = resolve_device(arguments.device)
     amp_enabled = bool(arguments.amp and device.type == "cuda")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
     model, checkpoint = load_baseline(arguments.baseline_checkpoint, device)
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Processed manifest not found: {manifest_path}")
-    manifest = pd.read_csv(manifest_path, dtype={"subject": str})
+    manifest = pd.read_csv(
+        manifest_path,
+        dtype={"subject": str, "recording_id": str},
+    )
+    scaler_document = load_scaler_document(manifest_path, config.project_root)
     manifest = manifest[manifest["split"].isin(arguments.splits)].copy()
     if manifest.empty:
         raise ValueError(f"No recordings found for splits {arguments.splits}.")
@@ -269,13 +311,24 @@ def main() -> None:
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
     print(f"Recordings to cache: {len(unique_recordings)}")
     print(f"Cache directory: {arguments.cache_dir.resolve()}")
     print(f"Storage dtype: {storage_dtype}; AMP encoding: {amp_enabled}")
 
     for index, row in unique_recordings.iterrows():
-        signal_path = resolve_stored_path(row["X_path"])
+        signal_path = resolve_stored_path(row["X_path"], config.project_root)
         cache_path = embedding_cache_path(signal_path, arguments.cache_dir)
+        availability_path = resolve_stored_path(
+            row["channel_availability_path"],
+            config.project_root,
+        )
+        with availability_path.open("r", encoding="utf-8") as availability_file:
+            channel_availability = np.asarray(
+                json.load(availability_file),
+                dtype=bool,
+            )
         number_of_chunks, skipped = encode_recording(
             signal_path=signal_path,
             cache_path=cache_path,
@@ -285,6 +338,14 @@ def main() -> None:
             storage_dtype=storage_dtype,
             amp_enabled=amp_enabled,
             overwrite=arguments.overwrite,
+            channel_names=list(config.canonical_channel_names),
+            channel_availability=channel_availability,
+            scaler=select_scaler(
+                scaler_document,
+                subject=str(row["subject"]).zfill(3),
+                recording_id=str(row["recording_id"]),
+            ),
+            scaler_document=scaler_document,
         )
         total_chunks += number_of_chunks
         skipped_recordings += int(skipped)

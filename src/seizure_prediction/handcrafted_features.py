@@ -195,10 +195,14 @@ def build_decision_feature_matrix(
     *,
     sampling_frequency: float = 256.0,
     minute_seconds: float = 60.0,
-    history_minutes: int = 45,
+    history_minutes: int,
     recent_minutes: int = 5,
 ) -> np.ndarray:
-    """Summarize cached minute features for every 45-minute decision."""
+    """Summarize cached minute features for every decision history.
+
+    ``history_minutes`` has no default: it is the swept input window, and a
+    stale default would silently summarize the wrong number of minutes.
+    """
     required = {
         "X_path",
         "channel_availability_path",

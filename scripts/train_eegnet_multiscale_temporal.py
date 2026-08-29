@@ -1,8 +1,9 @@
 r"""Train the residual multi-scale temporal head on cached EEGNet features.
 
 The selected baseline EEGNet encoder and classifier remain frozen.  The new
-head learns causal contrasts between 1-, 5-, 15-, and 45-minute embedding
-means.  Its zero initialization makes epoch zero equivalent to the baseline,
+head learns causal contrasts between nested embedding means whose widest scale
+is the input window, so the scale set follows the label definition being
+trained.  Its zero initialization makes epoch zero equivalent to the baseline,
 and model selection uses average precision on the complete natural-prevalence,
 patient-held-out validation split.
 
@@ -45,7 +46,11 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     CachedEmbeddingDecisionDataset,
@@ -54,6 +59,7 @@ from seizure_prediction.datasets import (  # noqa: E402
 from seizure_prediction.models import (  # noqa: E402
     EEGNetMultiScaleTemporalConfig,
     EEGNetMultiScaleTemporalRiskModel,
+    temporal_windows_for_history,
 )
 
 
@@ -93,7 +99,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument(
@@ -111,9 +117,7 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "embedding_cache"
+            CONFIG.embedding_cache_dir
             / "eegnet_baseline_ratio10_lr1e4"
         ),
     )
@@ -127,6 +131,7 @@ def parse_arguments() -> argparse.Namespace:
             / "eegnet_multiscale_temporal_ratio10"
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -159,14 +164,22 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select CUDA when available unless CPU was explicitly requested."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
@@ -184,6 +197,7 @@ def validate_embedding_cache(
     checkpoint_path: Path,
     embedding_dim: int,
     sequence_chunks: int,
+    config,
 ) -> None:
     """Ensure cached embeddings came from this exact baseline checkpoint."""
     metadata_path = cache_dir / "cache_metadata.json"
@@ -201,7 +215,7 @@ def validate_embedding_cache(
         raise ValueError("The embedding cache has a different embedding dimension.")
     chunk_samples = int(metadata.get("chunk_samples", -1))
     expected_chunk_samples = int(
-        round(CONFIG.chunk_window_seconds * CONFIG.target_sfreq)
+        round(config.chunk_window_seconds * config.target_sfreq)
     )
     if chunk_samples != expected_chunk_samples or sequence_chunks <= 0:
         raise ValueError("The embedding cache uses an incompatible chunk size.")
@@ -233,6 +247,7 @@ def sampling_prior_logit_correction(
 def build_loader(
     examples,
     *,
+    config,
     cache_dir: Path,
     embedding_dim: int,
     batch_size: int,
@@ -243,7 +258,7 @@ def build_loader(
     """Build a loader over compact cached decision histories."""
     dataset = CachedEmbeddingDecisionDataset(
         examples,
-        CONFIG,
+        config,
         cache_root=cache_dir,
         embedding_dim=embedding_dim,
     )
@@ -505,7 +520,8 @@ def main() -> None:
     """Initialize from the best baseline and fit the temporal residual."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
     if not arguments.baseline_checkpoint.exists():
@@ -526,9 +542,9 @@ def main() -> None:
     ):
         raise ValueError("The checkpoint does not contain a BaselineEEGNet model.")
 
-    chunk_seconds = CONFIG.chunk_window_seconds
+    chunk_seconds = config.chunk_window_seconds
     chunks_per_minute = int(round(60.0 / chunk_seconds))
-    sequence_chunks = int(round(CONFIG.input_window_seconds / chunk_seconds))
+    sequence_chunks = int(round(config.input_window_seconds / chunk_seconds))
     model_config = EEGNetMultiScaleTemporalConfig(
         n_chans=int(baseline_config["n_chans"]),
         chunk_samples=int(baseline_config["chunk_samples"]),
@@ -536,7 +552,9 @@ def main() -> None:
         chunks_per_minute=chunks_per_minute,
         embedding_dim=int(baseline_config["embedding_dim"]),
         temporal_hidden_dim=arguments.temporal_hidden_dim,
-        temporal_windows_minutes=(1, 5, 15, 45),
+        temporal_windows_minutes=temporal_windows_for_history(
+            sequence_chunks // chunks_per_minute
+        ),
         encoder_chunk_batch_size=int(
             baseline_config["encoder_chunk_batch_size"]
         ),
@@ -553,19 +571,22 @@ def main() -> None:
         arguments.baseline_checkpoint,
         model_config.embedding_dim,
         model_config.sequence_chunks,
+        config,
     )
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     train_sampler = BalancedEpochSampler(
         train_examples["label"],
@@ -574,6 +595,7 @@ def main() -> None:
     )
     train_loader = build_loader(
         train_examples,
+        config=config,
         cache_dir=arguments.cache_dir,
         embedding_dim=model_config.embedding_dim,
         batch_size=arguments.batch_size,
@@ -583,6 +605,7 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
+        config=config,
         cache_dir=arguments.cache_dir,
         embedding_dim=model_config.embedding_dim,
         batch_size=arguments.batch_size,
@@ -636,6 +659,8 @@ def main() -> None:
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
     print(json.dumps(counts, indent=2))
     print(
         "Parameters: "
@@ -643,7 +668,14 @@ def main() -> None:
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable."
     )
     print("Frozen baseline: EEGNet encoder plus original mean-pool classifier.")
-    print("Trainable branch: adjacent 1/5/15/45-minute temporal contrasts.")
+    print(
+        "Trainable branch: adjacent "
+        + "/".join(
+            f"{window:g}"
+            for window in model_config.temporal_windows_minutes
+        )
+        + "-minute temporal contrasts."
+    )
 
     initial_result = evaluate(
         model,

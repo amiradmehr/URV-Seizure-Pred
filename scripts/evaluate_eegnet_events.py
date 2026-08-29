@@ -40,7 +40,11 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     CachedEmbeddingDecisionDataset,
     load_decision_examples,
@@ -99,7 +103,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument(
@@ -117,9 +121,7 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "embedding_cache"
+            CONFIG.embedding_cache_dir
             / "eegnet_baseline_ratio10_lr1e4"
         ),
     )
@@ -133,6 +135,7 @@ def parse_arguments() -> argparse.Namespace:
             / "eegnet_baseline_ratio10_lr1e4_events"
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -165,14 +168,22 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select CUDA when available unless CPU was explicitly requested."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
@@ -241,6 +252,7 @@ def generate_validation_predictions(
     config: BaselineEEGNetConfig,
     examples: pd.DataFrame,
     *,
+    preprocessing_config,
     cache_dir: Path,
     batch_size: int,
     num_workers: int,
@@ -249,7 +261,7 @@ def generate_validation_predictions(
     """Run cached baseline inference without changing decision order."""
     dataset = CachedEmbeddingDecisionDataset(
         examples,
-        CONFIG,
+        preprocessing_config,
         cache_root=cache_dir,
         embedding_dim=config.embedding_dim,
     )
@@ -431,7 +443,8 @@ def main() -> None:
     """Generate validation scores and report event-level alarm performance."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
     model, model_config, checkpoint = load_baseline(
@@ -444,22 +457,26 @@ def main() -> None:
         model_config,
     )
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
     print(f"Validation decisions: {len(validation_examples):,}")
     print("Generating checkpoint-matched cached predictions...")
     predictions = generate_validation_predictions(
         model,
         model_config,
         validation_examples,
+        preprocessing_config=config,
         cache_dir=arguments.cache_dir,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
@@ -472,7 +489,7 @@ def main() -> None:
             "target_seizure_id",
         ].dropna().astype(str)
     )
-    seizure_manifest_path = CONFIG.manifests_dir / "seizure_manifest.csv"
+    seizure_manifest_path = config.manifests_dir / "seizure_manifest.csv"
     seizure_manifest = pd.read_csv(
         seizure_manifest_path,
         dtype={"subject": str},
@@ -490,8 +507,8 @@ def main() -> None:
         predictions["probability"],
         arguments.number_of_thresholds,
     )
-    horizon_seconds = CONFIG.prediction_horizon_minutes * 60.0
-    occurrence_seconds = CONFIG.seizure_occurrence_period_minutes * 60.0
+    horizon_seconds = config.prediction_horizon_minutes * 60.0
+    occurrence_seconds = config.seizure_occurrence_period_minutes * 60.0
     refractory_seconds = arguments.refractory_minutes * 60.0
     print(
         f"Validation AP: {validation_ap:.6f}; "
@@ -508,7 +525,7 @@ def main() -> None:
             prediction_horizon_seconds=horizon_seconds,
             occurrence_period_seconds=occurrence_seconds,
             refractory_seconds=refractory_seconds,
-            decision_stride_seconds=CONFIG.input_stride_seconds,
+            decision_stride_seconds=config.input_stride_seconds,
         )
         sweep_rows.append(evaluation.metrics)
         if threshold_index % 25 == 0 or threshold_index == len(thresholds):
@@ -529,7 +546,7 @@ def main() -> None:
         prediction_horizon_seconds=horizon_seconds,
         occurrence_period_seconds=occurrence_seconds,
         refractory_seconds=refractory_seconds,
-        decision_stride_seconds=CONFIG.input_stride_seconds,
+        decision_stride_seconds=config.input_stride_seconds,
     )
     bootstrap_intervals = bootstrap_patient_metrics(
         selected_evaluation.per_subject,
@@ -582,9 +599,9 @@ def main() -> None:
             "average_precision": validation_ap,
         },
         "alarm_definition": {
-            "prediction_horizon_minutes": CONFIG.prediction_horizon_minutes,
+            "prediction_horizon_minutes": config.prediction_horizon_minutes,
             "occurrence_period_minutes": (
-                CONFIG.seizure_occurrence_period_minutes
+                config.seizure_occurrence_period_minutes
             ),
             "refractory_minutes": arguments.refractory_minutes,
             "false_alarm_denominator": (

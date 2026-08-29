@@ -1,13 +1,19 @@
 """
-Validate the processed SeizeIT2 dataset.
+Validate the processed SeizeIT2 dataset for one label definition.
 
 Run from the repository root:
 
-    python scripts/validate_dataset.py
+    python scripts/validate_dataset.py [--window-minutes W] [--horizon-minutes H]
+
+The shards this checks reference the shared filtered recordings rather than
+standardized copies of their own, so the standardization checks here confirm
+that applying each shard's recorded scaler produces standardized EEG, rather
+than asserting it of the stored array.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -23,10 +29,17 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    PreprocessingConfig,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
+from seizure_prediction.datasets import resolve_stored_path  # noqa: E402
 from seizure_prediction.normalization import (  # noqa: E402
+    apply_channel_scaler,
     load_scaler_document,
     scaler_key_for,
+    select_scaler,
 )
 from seizure_prediction.preprocessing import (  # noqa: E402
     verify_patient_split_isolation,
@@ -44,10 +57,17 @@ def print_header(title: str) -> None:
     print(SEPARATOR)
 
 
-def load_processed_manifest() -> pd.DataFrame:
+def parse_arguments() -> argparse.Namespace:
+    """Parse the label definition to validate."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_label_definition_arguments(parser)
+    return parser.parse_args()
+
+
+def load_processed_manifest(config: PreprocessingConfig) -> pd.DataFrame:
     """Load the generated processed-shard manifest."""
     manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "processed_shard_manifest.csv"
     )
 
@@ -62,21 +82,33 @@ def load_processed_manifest() -> pd.DataFrame:
 
 def validate_single_shard(
     manifest_row: pd.Series,
+    config: PreprocessingConfig,
+    scaler_document: dict,
 ) -> dict[str, object]:
     """
-    Validate one processed shard and return summary statistics.
+    Validate one decision shard and return summary statistics.
+
+    ``X_path`` points into the shared filtered-recording store, so the
+    reported mean and standard deviation are those of the *standardized*
+    signal this shard's scaler produces, not of the stored array.
     """
-    X_path = Path(manifest_row["X_path"])
-    y_path = Path(manifest_row["y_path"])
-    metadata_path = Path(
-        manifest_row["metadata_path"]
+    X_path = resolve_stored_path(manifest_row["X_path"], config.project_root)
+    y_path = resolve_stored_path(manifest_row["y_path"], config.project_root)
+    metadata_path = resolve_stored_path(
+        manifest_row["metadata_path"], config.project_root
     )
-    channels_path = Path(
-        manifest_row["channels_path"]
+    channels_path = resolve_stored_path(
+        manifest_row["channels_path"], config.project_root
     )
-    availability_path = Path(
-        manifest_row["channel_availability_path"]
+    availability_path = resolve_stored_path(
+        manifest_row["channel_availability_path"], config.project_root
     )
+
+    if "_shared" not in X_path.parts:
+        raise ValueError(
+            f"{X_path} is not in the shared filtered-recording store. Every "
+            "label definition must reference the one shared copy of the EEG."
+        )
 
     for required_path in (
         X_path,
@@ -125,7 +157,7 @@ def validate_single_shard(
             dtype=np.int8,
         )
 
-    if channel_names != list(CONFIG.canonical_channel_names):
+    if channel_names != list(config.canonical_channel_names):
         raise ValueError(
             f"Unexpected channel layout in {channels_path}: "
             f"{channel_names}"
@@ -174,8 +206,8 @@ def validate_single_shard(
 
     expected_history_samples = int(
         round(
-            CONFIG.target_sfreq
-            * CONFIG.input_window_seconds
+            config.target_sfreq
+            * config.input_window_seconds
         )
     )
 
@@ -203,11 +235,13 @@ def validate_single_shard(
 
     if not history_lengths.eq(expected_history_samples).all():
         raise ValueError(
-            f"Incorrect 45-minute history length in {metadata_path}."
+            "Incorrect "
+            f"{config.input_window_seconds / 60.0:g}-minute history length in "
+            f"{metadata_path}."
         )
 
     expected_chunk_samples = int(
-        round(CONFIG.chunk_window_seconds * CONFIG.target_sfreq)
+        round(config.chunk_window_seconds * config.target_sfreq)
     )
     expected_chunks_per_history = (
         expected_history_samples // expected_chunk_samples
@@ -217,7 +251,8 @@ def validate_single_shard(
         metadata["chunks_per_history"].eq(expected_chunks_per_history).all()
     ):
         raise ValueError(
-            f"Incorrect 5-second chunk metadata in {metadata_path}."
+            f"Incorrect {config.chunk_window_seconds:g}-second chunk metadata "
+            f"in {metadata_path}."
         )
 
     if (metadata["history_start_sample"] < 0).any() or (
@@ -228,7 +263,7 @@ def validate_single_shard(
         )
 
     expected_occurrence_seconds = (
-        CONFIG.seizure_occurrence_period_minutes * 60.0
+        config.seizure_occurrence_period_minutes * 60.0
     )
     occurrence_lengths = (
         metadata["prediction_stop_seconds"]
@@ -240,13 +275,23 @@ def validate_single_shard(
             f"Incorrect prediction occurrence period in {metadata_path}."
         )
 
+    # The prediction interval opens `prediction_horizon_minutes` after the
+    # decision. That is zero in this risk task, so the interval starts at the
+    # decision time; asserting the configured offset rather than zero keeps
+    # this check correct if a warning horizon is ever introduced.
+    expected_prediction_start = (
+        metadata["decision_time_seconds"]
+        + config.prediction_horizon_minutes * 60.0
+    )
+
     if not np.allclose(
         metadata["prediction_start_seconds"],
-        metadata["decision_time_seconds"],
+        expected_prediction_start,
     ):
         raise ValueError(
-            f"Prediction interval does not start at the decision time in "
-            f"{metadata_path}."
+            "Prediction interval does not start "
+            f"{config.prediction_horizon_minutes:g} minute(s) after the "
+            f"decision time in {metadata_path}."
         )
 
     unique_labels = set(
@@ -262,6 +307,7 @@ def validate_single_shard(
         raise ValueError(
             f"NaN or infinite EEG value found in {X_path}."
         )
+
 
     if not np.isfinite(y).all():
         raise ValueError(
@@ -337,6 +383,30 @@ def validate_single_shard(
                 f"in {metadata_path}."
             )
 
+    # The stored EEG is filtered but not standardized, so summarize what the
+    # loader will actually feed the model: this shard's scaler applied to this
+    # recording. This is the check that the shared store and the per-shard
+    # scaler still belong together.
+    standardized = apply_channel_scaler(
+        X=np.asarray(X, dtype=np.float32),
+        channel_names=channel_names,
+        channel_availability=channel_availability.astype(bool),
+        scaler=select_scaler(
+            scaler_document,
+            subject=str(manifest_row["subject"]).zfill(3),
+            recording_id=str(manifest_row["recording_id"]),
+        ),
+        document=scaler_document,
+        output_dtype="float32",
+    )
+
+    available_channels = channel_availability.astype(bool)
+
+    if not np.isfinite(standardized).all():
+        raise ValueError(
+            f"Standardizing {X_path} produced a non-finite value."
+        )
+
     return {
         "split": expected_split,
         "subject": str(
@@ -356,22 +426,18 @@ def validate_single_shard(
             np.sum(y == 0)
         ),
         "mean": float(
-            np.asarray(X).mean(
-                dtype=np.float64
-            )
+            standardized[available_channels].mean(dtype=np.float64)
         ),
         "std": float(
-            np.asarray(X).std(
-                dtype=np.float64
-            )
+            standardized[available_channels].std(dtype=np.float64)
         ),
     }
 
 
-def load_window_manifest() -> pd.DataFrame:
+def load_window_manifest(config: PreprocessingConfig) -> pd.DataFrame:
     """Load complete decision metadata with stable subject IDs."""
     window_manifest_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "decision_manifest.csv"
     )
 
@@ -391,20 +457,23 @@ def load_window_manifest() -> pd.DataFrame:
         },
     )
 
-def validate_patient_split_isolation() -> list[str]:
+def validate_patient_split_isolation(
+    config: PreprocessingConfig,
+    expected_subjects: tuple[str, ...],
+) -> list[str]:
     """Verify observed patients stay in their configured split.
 
     A configured patient may legitimately have no retained decision points
-    after the 60-minute clean-history and artifact exclusions. Such a patient
-    has no shard and cannot leak across splits, so it is reported rather than
+    after the clean-history and artifact exclusions. Such a patient has no
+    shard and cannot leak across splits, so it is reported rather than
     treated as a split-isolation error.
     """
-    metadata = load_window_manifest()
-    verify_patient_split_isolation(metadata, CONFIG)
+    metadata = load_window_manifest(config)
+    verify_patient_split_isolation(metadata, config)
 
     observed_subjects = set(metadata["subject"].map(str))
     missing_subjects = sorted(
-        set(CONFIG.included_subjects) - observed_subjects
+        set(expected_subjects) - observed_subjects
     )
 
     if missing_subjects:
@@ -416,14 +485,14 @@ def validate_patient_split_isolation() -> list[str]:
     return missing_subjects
 
 
-def validate_seizure_split_overlap() -> None:
+def validate_seizure_split_overlap(config: PreprocessingConfig) -> None:
     """
     Report seizure IDs appearing in multiple splits.
 
     A patient-level split should keep every target seizure in exactly one
     split. This check makes any violation visible.
     """
-    metadata = load_window_manifest()
+    metadata = load_window_manifest(config)
 
     positives = metadata[
         metadata["label"] == 1
@@ -468,9 +537,14 @@ def validate_seizure_split_overlap() -> None:
     )
 
 
-def validate_target_seizure_eligibility() -> None:
-    """Ensure every positive decision targets a 60-minute-clear seizure."""
-    seizure_manifest_path = CONFIG.manifests_dir / "seizure_manifest.csv"
+def validate_target_seizure_eligibility(config: PreprocessingConfig) -> None:
+    """Ensure every positive decision targets a sufficiently clear seizure.
+
+    The requirement is `minimum_preseizure_clear_minutes` of continuous clear
+    EEG before onset, held constant across every window/horizon combination so
+    that all of them score the same cohort of seizures.
+    """
+    seizure_manifest_path = config.manifests_dir / "seizure_manifest.csv"
 
     if not seizure_manifest_path.exists():
         raise FileNotFoundError(
@@ -488,30 +562,60 @@ def validate_target_seizure_eligibility() -> None:
         seizures["eligible_for_prediction"].astype(str).str.lower().eq("true")
     )
     eligible_ids = set(seizures.loc[eligibility_mask, "seizure_id"].astype(str))
-    positives = load_window_manifest().query("label == 1")
+    positives = load_window_manifest(config).query("label == 1")
     target_ids = set(positives["target_seizure_id"].dropna().astype(str))
     ineligible_ids = sorted(target_ids - eligible_ids)
 
     if ineligible_ids:
         raise ValueError(
-            "Positive decisions target seizures without 60 minutes of clear "
+            "Positive decisions target seizures without "
+            f"{config.minimum_preseizure_clear_minutes:g} minutes of clear "
             f"pre-seizure EEG: {ineligible_ids}"
         )
 
 
-def validate_split_class_coverage() -> None:
-    """Require each split to include positive and negative decisions."""
-    metadata = load_window_manifest()
+def validate_split_class_coverage(config: PreprocessingConfig) -> None:
+    """Require each fully built split to include both classes.
+
+    A split with only one class makes average precision undefined, so for a
+    complete build this is an error.  A build restricted with ``--subjects``
+    is different: covering one of thirteen test patients says nothing about
+    the dataset, only about the cohort that was asked for.  Such a split is
+    therefore reported rather than failed, and the strict guarantee still
+    holds for every split whose configured patients are all present.
+    """
+    metadata = load_window_manifest(config)
     expected_labels = {0, 1}
+
+    configured_subjects = {
+        "train": set(config.train_subjects),
+        "validation": set(config.validation_subjects),
+        "test": set(config.test_subjects),
+    }
 
     for split_name, split_metadata in metadata.groupby("split", sort=True):
         labels = set(split_metadata["label"].unique().tolist())
 
-        if labels != expected_labels:
-            raise ValueError(
-                f"Split {split_name} does not contain both classes. "
-                f"Found labels: {sorted(labels)}"
+        if labels == expected_labels:
+            continue
+
+        present = set(split_metadata["subject"].astype(str).str.zfill(3))
+        configured = configured_subjects.get(str(split_name), set())
+        absent = configured - present
+
+        if absent:
+            print(
+                f"  Split {split_name} contains only labels {sorted(labels)}, "
+                f"but {len(absent)} of its {len(configured)} configured "
+                "patients produced no decisions. Treating this as a partial "
+                "build rather than a dataset defect."
             )
+            continue
+
+        raise ValueError(
+            f"Split {split_name} does not contain both classes. "
+            f"Found labels: {sorted(labels)}"
+        )
 
 
 def validate_training_standardization(
@@ -520,9 +624,11 @@ def validate_training_standardization(
     """
     Perform a broad sanity check on training standardization.
 
-    The global channel statistics are fitted only from training patients.
-    Individual training shards are not expected to have exact mean zero or
-    unit standard deviation.
+    The summarized values are those of the standardized signal each shard's
+    scaler produces from the shared filtered recording. Under ``global``
+    scaling the statistics come only from training patients, so individual
+    training shards are not expected to have exact mean zero or unit standard
+    deviation.
     """
     training = shard_summaries[
         shard_summaries["split"] == "train"
@@ -556,7 +662,10 @@ def validate_training_standardization(
         )
 
 
-def validate_global_scaler() -> None:
+def validate_scaler_document(
+    config: PreprocessingConfig,
+    scaler_path: Path,
+) -> dict:
     """Confirm the saved scalers match the configured normalization scope.
 
     Only ``global`` mode carries a train/validation/test asymmetry, so only
@@ -564,22 +673,10 @@ def validate_global_scaler() -> None:
     scalers are fitted from the data they normalize by design; they are checked
     instead for complete coverage of the processed dataset.
     """
-    document_path = CONFIG.scaler_parameters_dir / "channel_scalers.json"
-    legacy_path = CONFIG.scaler_parameters_dir / "global_channel_zscore.json"
-
-    if document_path.exists():
-        scaler_path = document_path
-    elif legacy_path.exists():
-        scaler_path = legacy_path
-    else:
-        raise FileNotFoundError(
-            f"No scaler document found at {document_path} or {legacy_path}"
-        )
-
     document = load_scaler_document(scaler_path)
     mode = document["normalization_mode"]
 
-    if document.get("channel_names") != list(CONFIG.canonical_channel_names):
+    if document.get("channel_names") != list(config.canonical_channel_names):
         raise ValueError(
             "Scaler channel layout does not match the configured canonical "
             "layout."
@@ -597,16 +694,16 @@ def validate_global_scaler() -> None:
         if not scaler_subjects:
             raise ValueError("Global scaler records no training subjects.")
 
-        if not scaler_subjects.issubset(set(CONFIG.train_subjects)):
+        if not scaler_subjects.issubset(set(config.train_subjects)):
             raise ValueError(
                 "Global scaler includes validation/test subjects: "
-                f"{sorted(scaler_subjects - set(CONFIG.train_subjects))}"
+                f"{sorted(scaler_subjects - set(config.train_subjects))}"
             )
-        return
+        return document
 
     # Per-patient and per-recording scaling must cover every processed shard,
     # otherwise some recording would be standardized by another group's stats.
-    manifest = load_processed_manifest()
+    manifest = load_processed_manifest(config)
     required_keys = {
         scaler_key_for(
             mode,
@@ -630,19 +727,54 @@ def validate_global_scaler() -> None:
             "between patients."
         )
 
+    return document
+
 
 def main() -> None:
-    """Run all validation checks."""
-    CONFIG.validate()
+    """Run all validation checks for one label definition."""
+    arguments = parse_arguments()
+    config = resolve_label_definition(arguments)
+    config.validate()
 
     print_header("PROCESSED SEIZEIT2 VALIDATION")
 
-    processed_manifest = load_processed_manifest()
+    print(
+        f"Label definition:   {config.experiment_tag or 'default'} "
+        f"(window {config.input_window_seconds / 60.0:g} min, "
+        f"horizon {config.seizure_occurrence_period_minutes:g} min)"
+    )
+    print(f"Manifests:          {config.manifests_dir}")
+    print(f"Shared recordings:  {config.unscaled_recordings_dir}")
+
+    processed_manifest = load_processed_manifest(config)
 
     if processed_manifest.empty:
         raise ValueError(
             "The processed shard manifest is empty."
         )
+
+    if "scaler_document_path" not in processed_manifest.columns:
+        raise ValueError(
+            "The processed manifest does not record which scaler document it "
+            "was built against. Rebuild it with scripts/build_dataset.py."
+        )
+
+    scaler_paths = sorted(
+        set(processed_manifest["scaler_document_path"].astype(str))
+    )
+
+    if len(scaler_paths) != 1:
+        raise ValueError(
+            "A processed manifest must reference exactly one scaler "
+            f"document; found {scaler_paths}."
+        )
+
+    scaler_path = resolve_stored_path(scaler_paths[0], config.project_root)
+
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"No scaler document found at {scaler_path}")
+
+    scaler_document = validate_scaler_document(config, scaler_path)
 
     shard_summaries: list[dict[str, object]] = []
 
@@ -651,7 +783,9 @@ def main() -> None:
         start=1,
     ):
         summary = validate_single_shard(
-            manifest_row
+            manifest_row,
+            config,
+            scaler_document,
         )
 
         shard_summaries.append(summary)
@@ -672,7 +806,16 @@ def main() -> None:
 
     print_header("PATIENT-LEVEL SPLIT VALIDATION")
 
-    excluded_subjects = validate_patient_split_isolation()
+    # A build may deliberately cover a subset of subjects, so only the
+    # subjects this manifest actually contains are expected to appear.
+    expected_subjects = tuple(
+        sorted(set(processed_manifest["subject"].astype(str).str.zfill(3)))
+    )
+
+    excluded_subjects = validate_patient_split_isolation(
+        config,
+        expected_subjects,
+    )
     print(
         "Patient split isolation: PASS"
         + (
@@ -682,13 +825,16 @@ def main() -> None:
         )
     )
 
-    validate_seizure_split_overlap()
+    validate_seizure_split_overlap(config)
     print("Seizure split isolation: PASS")
 
-    validate_target_seizure_eligibility()
-    print("Target-seizure 60-minute eligibility: PASS")
+    validate_target_seizure_eligibility(config)
+    print(
+        "Target-seizure "
+        f"{config.minimum_preseizure_clear_minutes:g}-minute eligibility: PASS"
+    )
 
-    validate_split_class_coverage()
+    validate_split_class_coverage(config)
     print("Split class coverage: PASS")
 
     validate_training_standardization(
@@ -696,8 +842,7 @@ def main() -> None:
     )
     print("Standardization sanity checks: PASS")
 
-    validate_global_scaler()
-    print("Global train-only scaler provenance: PASS")
+    print("Scaler provenance and coverage: PASS")
 
     print_header("DATASET SUMMARY")
 
@@ -723,7 +868,7 @@ def main() -> None:
     print(split_summary.to_string(index=False))
 
     output_path = (
-        CONFIG.manifests_dir
+        config.manifests_dir
         / "validation_summary.csv"
     )
 

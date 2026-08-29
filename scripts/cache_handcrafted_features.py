@@ -22,11 +22,20 @@ SRC_DIRECTORY = PROJECT_ROOT / "src"
 if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     PatientEventBalancedEpochSampler,
     load_decision_examples,
+    load_scaler_document,
     resolve_stored_path,
+)
+from seizure_prediction.normalization import (  # noqa: E402
+    apply_channel_scaler,
+    select_scaler,
 )
 from seizure_prediction.handcrafted_features import (  # noqa: E402
     FEATURE_NAMES,
@@ -43,10 +52,13 @@ def parse_arguments() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=(
-            PROJECT_ROOT
-            / "data"
-            / "handcrafted_feature_cache"
+            CONFIG.handcrafted_feature_cache_dir
             / "ava_minute_selected_v1"
+        ),
+        help=(
+            "Features are extracted per whole minute of a recording, so the "
+            "cache does not depend on the input window or horizon and is "
+            "shared by every label definition."
         ),
     )
     parser.add_argument(
@@ -90,6 +102,7 @@ def parse_arguments() -> argparse.Namespace:
             "analyses that use all of a patient's decisions."
         ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -123,12 +136,22 @@ def cache_recording(
     minute_batch_size: int,
     entropy_bins: int,
     overwrite: bool,
+    sampling_frequency: float,
+    channel_names: list[str],
+    scaler: dict,
+    scaler_document: dict,
 ) -> tuple[int, bool]:
+    """Extract and cache per-minute features for one recording.
+
+    The stored recording is filtered but not standardized, so each minute
+    batch is standardized here with the same per-channel affine map the
+    training loader applies.
+    """
     eeg = np.load(signal_path, mmap_mode="r")
     availability = load_channel_availability(availability_path)
     if eeg.ndim != 2 or availability.shape != (eeg.shape[0],):
         raise ValueError(f"Invalid signal or availability shape for {signal_path}")
-    samples_per_minute = int(round(CONFIG.target_sfreq * 60.0))
+    samples_per_minute = int(round(sampling_frequency * 60.0))
     minute_count = eeg.shape[1] // samples_per_minute
     if minute_count == 0:
         raise ValueError(f"Recording is shorter than one minute: {signal_path}")
@@ -169,7 +192,17 @@ def cache_recording(
                 stop = min(start + minute_batch_size, stop_minute)
                 sample_start = start * samples_per_minute
                 sample_stop = stop * samples_per_minute
-                batch = np.asarray(eeg[:, sample_start:sample_stop], dtype=np.float32)
+                batch = apply_channel_scaler(
+                    X=np.asarray(
+                        eeg[:, sample_start:sample_stop],
+                        dtype=np.float32,
+                    ),
+                    channel_names=channel_names,
+                    channel_availability=availability,
+                    scaler=scaler,
+                    document=scaler_document,
+                    output_dtype="float32",
+                )
                 windows = np.ascontiguousarray(
                     batch.reshape(eeg.shape[0], stop - start, samples_per_minute)
                     .transpose(1, 0, 2)
@@ -177,7 +210,7 @@ def cache_recording(
                 cached[start:stop] = extract_ava_feature_batch(
                     windows,
                     availability,
-                    sampling_frequency=CONFIG.target_sfreq,
+                    sampling_frequency=sampling_frequency,
                     entropy_bins=entropy_bins,
                 )
         cached.flush()
@@ -200,6 +233,7 @@ def run_cache_job(job: dict[str, object]) -> tuple[int, bool]:
 def required_minute_coverage(
     examples: pd.DataFrame,
     manifest: pd.DataFrame,
+    config,
     complete_subjects: set[str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Return exact whole-minute coverage needed by the selected decisions.
@@ -209,13 +243,17 @@ def required_minute_coverage(
     select. Per-patient analyses such as leave-one-recording-out need all of a
     patient's decisions, not a training subsample.
     """
-    samples_per_minute = int(round(CONFIG.target_sfreq * 60.0))
+    samples_per_minute = int(round(config.target_sfreq * 60.0))
+    history_minutes = int(round(config.input_window_seconds / 60.0))
     complete_subjects = {
         str(subject).zfill(3) for subject in (complete_subjects or set())
     }
     signal_minutes = {
-        str(resolve_stored_path(row.X_path)): (
-            np.load(resolve_stored_path(row.X_path), mmap_mode="r").shape[1]
+        str(resolve_stored_path(row.X_path, config.project_root)): (
+            np.load(
+                resolve_stored_path(row.X_path, config.project_root),
+                mmap_mode="r",
+            ).shape[1]
             // samples_per_minute
         )
         for row in manifest.itertuples(index=False)
@@ -224,18 +262,21 @@ def required_minute_coverage(
         path: np.zeros(minutes, dtype=bool) for path, minutes in signal_minutes.items()
     }
     for row in examples.itertuples(index=False):
-        path = str(resolve_stored_path(row.X_path))
+        path = str(resolve_stored_path(row.X_path, config.project_root))
         start = int(row.history_start_sample) // samples_per_minute
         stop = int(row.decision_end_sample) // samples_per_minute
-        if path not in coverage or stop - start != 45:
-            raise ValueError("Selected decision does not match a cache recording/history.")
+        if path not in coverage or stop - start != history_minutes:
+            raise ValueError(
+                "Selected decision does not match a cache recording, or its "
+                f"history is not the configured {history_minutes} minutes."
+            )
         coverage[path][start:stop] = True
 
     if complete_subjects:
         for row in manifest.itertuples(index=False):
             if str(row.subject).zfill(3) not in complete_subjects:
                 continue
-            path = str(resolve_stored_path(row.X_path))
+            path = str(resolve_stored_path(row.X_path, config.project_root))
             coverage[path][:] = True
 
     return coverage
@@ -243,7 +284,8 @@ def required_minute_coverage(
 
 def main() -> None:
     arguments = parse_arguments()
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     if arguments.minute_batch_size <= 0:
         raise ValueError("minute-batch-size must be positive.")
     if arguments.entropy_bins < 2:
@@ -253,8 +295,12 @@ def main() -> None:
     if arguments.workers <= 0:
         raise ValueError("workers must be positive.")
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
-    manifest = pd.read_csv(manifest_path, dtype={"subject": str})
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
+    manifest = pd.read_csv(
+        manifest_path,
+        dtype={"subject": str, "recording_id": str},
+    )
+    scaler_document = load_scaler_document(manifest_path, config.project_root)
     manifest = manifest[manifest["split"].isin(arguments.splits)].copy()
     if manifest.empty:
         raise ValueError(f"No recordings found for splits {arguments.splits}.")
@@ -266,6 +312,7 @@ def main() -> None:
             split="train",
             negative_to_positive_ratio=None,
             seed=arguments.seed,
+            project_root=config.project_root,
         )
         sampler = PatientEventBalancedEpochSampler(
             train_examples,
@@ -287,6 +334,7 @@ def main() -> None:
                 split="validation",
                 negative_to_positive_ratio=None,
                 seed=arguments.seed,
+                project_root=config.project_root,
             )
         )
     if "test" in arguments.splits:
@@ -296,6 +344,7 @@ def main() -> None:
                 split="test",
                 negative_to_positive_ratio=None,
                 seed=arguments.seed,
+                project_root=config.project_root,
             )
         )
     selected = pd.concat(selected_examples, ignore_index=True)
@@ -314,6 +363,7 @@ def main() -> None:
     coverage_by_path = required_minute_coverage(
         selected,
         recordings,
+        config,
         complete_subjects=set(arguments.complete_subjects),
     )
     if arguments.complete_subjects:
@@ -329,8 +379,11 @@ def main() -> None:
     jobs: list[dict[str, object]] = []
     recording_names: list[str] = []
     for _, row in recordings.iterrows():
-        signal_path = resolve_stored_path(row["X_path"])
-        availability_path = resolve_stored_path(row["channel_availability_path"])
+        signal_path = resolve_stored_path(row["X_path"], config.project_root)
+        availability_path = resolve_stored_path(
+            row["channel_availability_path"],
+            config.project_root,
+        )
         output_path = feature_cache_path(signal_path, arguments.cache_dir)
         coverage_path = feature_coverage_path(signal_path, arguments.cache_dir)
         jobs.append(
@@ -343,6 +396,14 @@ def main() -> None:
                 "minute_batch_size": arguments.minute_batch_size,
                 "entropy_bins": arguments.entropy_bins,
                 "overwrite": arguments.overwrite,
+                "sampling_frequency": config.target_sfreq,
+                "channel_names": list(config.canonical_channel_names),
+                "scaler": select_scaler(
+                    scaler_document,
+                    subject=str(row["subject"]).zfill(3),
+                    recording_id=str(row["recording_id"]),
+                ),
+                "scaler_document": scaler_document,
             }
         )
         recording_names.append(signal_path.name)
@@ -361,7 +422,7 @@ def main() -> None:
     metadata = {
         "extractor": "AVA-style minute features v1",
         "feature_names": list(FEATURE_NAMES),
-        "sampling_frequency": CONFIG.target_sfreq,
+        "sampling_frequency": config.target_sfreq,
         "window_seconds": 60.0,
         "welch_segment_seconds": 2.0,
         "entropy_bins": arguments.entropy_bins,

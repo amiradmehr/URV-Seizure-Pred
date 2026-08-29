@@ -1,7 +1,8 @@
 r"""Train the single active EEGNet seizure-risk baseline.
 
-The model uses 45 minutes of EEG to predict seizure onset in the next
-10 minutes. The default training strategy sees every positive decision and a
+The model uses the configured input window of EEG (30 minutes by default)
+to predict seizure onset in the following seizure occurrence period
+(10 minutes by default). The default training strategy sees every positive decision and a
 new 4:1 sample of negative decisions each epoch. An optional patient/event-
 balanced strategy changes exposure without changing the model. Validation
 always uses the complete natural, patient-held-out validation split.
@@ -49,12 +50,16 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    add_label_definition_arguments,
+    resolve_label_definition,
+)
 from seizure_prediction.datasets import (  # noqa: E402
     BalancedEpochSampler,
     PatientEventBalancedEpochSampler,
     StreamingDecisionDataset,
     load_decision_examples,
+    load_scaler_document,
 )
 from seizure_prediction.models import (  # noqa: E402
     BaselineEEGNet,
@@ -126,15 +131,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PROJECT_ROOT / "outputs" / "models" / "eegnet_baseline",
-        help="A separate directory is recommended for every experimental run.",
+        default=None,
+        help=(
+            "A separate directory is recommended for every experimental run. "
+            "Defaults to outputs/models/eegnet_baseline/<label definition tag>."
+        ),
     )
+    add_label_definition_arguments(parser)
     return parser.parse_args()
 
 
@@ -171,28 +180,42 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 
 def resolve_device(requested_device: str) -> torch.device:
-    """Select CUDA when available unless the caller explicitly requests CPU."""
+    """Select the requested accelerator, preferring CUDA then MPS then CPU under 'auto'."""
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+    if requested_device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but no MPS device is available.")
     if requested_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(requested_device)
 
 
 def build_loader(
     examples,
     *,
+    config,
+    scaler_document: dict,
     batch_size: int,
     num_workers: int,
     device: torch.device,
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
-    """Build a lazy loader without copying complete recordings into memory."""
+    """Build a lazy loader without copying complete recordings into memory.
+
+    The dataset standardizes each history as it is sliced, since the shards
+    reference the shared filtered recordings rather than standardized copies.
+    """
     return DataLoader(
-        StreamingDecisionDataset(examples, CONFIG),
+        StreamingDecisionDataset(examples, config, scaler_document),
         batch_size=batch_size,
         sampler=sampler,
         shuffle=False,
@@ -326,8 +349,12 @@ def save_learning_curves(
 def save_model_overview(
     config: BaselineEEGNetConfig,
     output_path: Path,
+    horizon_minutes: float,
 ) -> None:
     """Draw a presentation-ready overview of the active model architecture."""
+    window_minutes = (
+        config.sequence_chunks * config.chunk_samples / 256.0 / 60.0
+    )
     figure, axis = plt.subplots(figsize=(15, 4))
     axis.set_xlim(0.0, 1.0)
     axis.set_ylim(0.0, 1.0)
@@ -338,9 +365,15 @@ def save_model_overview(
     box_y = 0.48
     box_x_values = (0.015, 0.18, 0.345, 0.51, 0.675, 0.84)
     labels = (
-        "45-min EEG input\n540 × 3 × 1,280",
-        "Shared EEGNet\non each 5-s chunk",
-        f"Chunk features\n540 × {config.embedding_dim}",
+        (
+            f"{window_minutes:g}-min EEG input\n"
+            f"{config.sequence_chunks:,} × 3 × {config.chunk_samples:,}"
+        ),
+        (
+            "Shared EEGNet\non each "
+            f"{config.chunk_samples / 256.0:g}-s chunk"
+        ),
+        f"Chunk features\n{config.sequence_chunks:,} × {config.embedding_dim}",
         f"Mean pooling\n{config.embedding_dim} features",
         "Add electrode mask\n+ 3 availability values",
         "Linear classifier\n1 risk probability",
@@ -376,7 +409,8 @@ def save_model_overview(
     axis.text(
         0.5,
         0.25,
-        "One output per decision: seizure onset within the next 10 minutes",
+        "One output per decision: seizure onset within the next "
+        f"{horizon_minutes:g} minutes",
         ha="center",
         va="center",
         fontsize=11,
@@ -400,6 +434,7 @@ def save_model_overview(
 def save_validation_summary(
     result: EvaluationResult,
     output_path: Path,
+    horizon_minutes: float,
 ) -> None:
     """Plot the best model's precision-recall curve and risk distributions."""
     prevalence = float(np.mean(result.labels))
@@ -439,14 +474,14 @@ def save_validation_summary(
         bins=bins,
         density=True,
         alpha=0.55,
-        label="No seizure in next 10 min",
+        label=f"No seizure in next {horizon_minutes:g} min",
     )
     score_axis.hist(
         positive_scores,
         bins=bins,
         density=True,
         alpha=0.55,
-        label="Seizure in next 10 min",
+        label=f"Seizure in next {horizon_minutes:g} min",
     )
     score_axis.set(
         title="Validation risk-score distributions",
@@ -463,33 +498,20 @@ def save_validation_summary(
     plt.close(figure)
 
 
-def processed_normalization() -> dict[str, object]:
-    """Describe how data/processed was standardized when this run started.
+def processed_normalization(scaler_document: dict) -> dict[str, object]:
+    """Describe how this run standardizes the shared recordings.
 
     Two runs that differ only in normalization scope are otherwise identical
     inside metrics.json, so recording it here is what makes them comparable
-    later. Missing state means the original global build, which predates the
-    marker file.
+    later. It comes from the scaler document the manifest names, so it always
+    describes the transform actually applied rather than a separate marker
+    file that could drift from it.
     """
-    state_path = CONFIG.processed_data_dir / "normalization_state.json"
-    if not state_path.exists():
-        return {
-            "normalization_mode": "global",
-            "statistic": "meanstd",
-            "source": "assumed; no normalization_state.json present",
-        }
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    if state.get("in_progress", False):
-        raise RuntimeError(
-            f"{state_path} reports an unfinished re-standardization. "
-            "data/processed is in a mixed state; rerun "
-            "scripts/restandardize_processed.py before training."
-        )
     return {
-        "normalization_mode": state.get("normalization_mode"),
-        "statistic": state.get("statistic"),
-        "converted_recordings": len(state.get("converted_recordings", [])),
-        "source": str(state_path),
+        "normalization_mode": scaler_document.get("normalization_mode"),
+        "statistic": scaler_document.get("statistic"),
+        "scaler_count": scaler_document.get("scaler_count"),
+        "source": "scaler document named by the processed shard manifest",
     }
 
 
@@ -497,6 +519,8 @@ def save_metrics(
     *,
     output_path: Path,
     arguments: argparse.Namespace,
+    normalization: dict[str, object],
+    label_definition: dict[str, object],
     counts: dict[str, int],
     population_positive_fraction: float,
     sampled_positive_fraction: float,
@@ -510,7 +534,8 @@ def save_metrics(
         json.dumps(
             {
                 "model": "BaselineEEGNet",
-                "input_normalization": processed_normalization(),
+                "label_definition": label_definition,
+                "input_normalization": normalization,
                 "primary_comparison_metric": "validation_average_precision",
                 "training_metric": "binary_cross_entropy",
                 "validation_metrics": [
@@ -559,32 +584,62 @@ def main() -> None:
     """Train, select, checkpoint, and visualize the baseline EEGNet."""
     arguments = parse_arguments()
     validate_arguments(arguments)
-    CONFIG.validate()
+    config = resolve_label_definition(arguments)
+    config.validate()
     set_seed(arguments.seed)
     device = resolve_device(arguments.device)
 
-    # Checked before loading data so an interrupted re-standardization fails
-    # here rather than after a full training run.
-    normalization = processed_normalization()
+    if arguments.output_dir is None:
+        arguments.output_dir = (
+            PROJECT_ROOT
+            / "outputs"
+            / "models"
+            / "eegnet_baseline"
+            / (config.experiment_tag or "default")
+        )
 
-    manifest_path = CONFIG.manifests_dir / "processed_shard_manifest.csv"
+    manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Processed manifest not found: {manifest_path}. "
             "Run build_dataset.py and validate_dataset.py first."
         )
 
+    # The shards reference filtered, unstandardized EEG, so the scaler is
+    # loaded here and applied by the dataset as each history is sliced.
+    scaler_document = load_scaler_document(manifest_path, config.project_root)
+    normalization = processed_normalization(scaler_document)
+    label_definition = {
+        "experiment_tag": config.experiment_tag,
+        "input_window_minutes": config.input_window_seconds / 60.0,
+        "seizure_occurrence_period_minutes": (
+            config.seizure_occurrence_period_minutes
+        ),
+        "prediction_horizon_minutes": config.prediction_horizon_minutes,
+        "minimum_preseizure_clear_minutes": (
+            config.minimum_preseizure_clear_minutes
+        ),
+    }
+
+    print(
+        f"Label definition: {config.experiment_tag or 'default'} "
+        f"(window {config.input_window_seconds / 60.0:g} min, "
+        f"horizon {config.seizure_occurrence_period_minutes:g} min)"
+    )
+
     train_examples = load_decision_examples(
         manifest_path,
         split="train",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     validation_examples = load_decision_examples(
         manifest_path,
         split="validation",
         negative_to_positive_ratio=None,
         seed=arguments.seed,
+        project_root=config.project_root,
     )
     if arguments.sampling_strategy == "patient-event-balanced":
         train_sampler = PatientEventBalancedEpochSampler(
@@ -601,6 +656,8 @@ def main() -> None:
         )
     train_loader = build_loader(
         train_examples,
+        config=config,
+        scaler_document=scaler_document,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
@@ -608,6 +665,8 @@ def main() -> None:
     )
     validation_loader = build_loader(
         validation_examples,
+        config=config,
+        scaler_document=scaler_document,
         batch_size=arguments.batch_size,
         num_workers=arguments.num_workers,
         device=device,
@@ -626,10 +685,10 @@ def main() -> None:
     )
 
     model_config = BaselineEEGNetConfig(
-        n_chans=len(CONFIG.canonical_channel_names),
-        chunk_samples=int(CONFIG.chunk_window_seconds * CONFIG.target_sfreq),
+        n_chans=len(config.canonical_channel_names),
+        chunk_samples=int(config.chunk_window_seconds * config.target_sfreq),
         sequence_chunks=int(
-            CONFIG.input_window_seconds / CONFIG.chunk_window_seconds
+            config.input_window_seconds / config.chunk_window_seconds
         ),
         embedding_dim=arguments.embedding_dim,
         encoder_chunk_batch_size=arguments.encoder_chunk_batch_size,
@@ -712,7 +771,11 @@ def main() -> None:
         "Primary model-comparison metric: average precision on the full "
         "natural-prevalence validation split."
     )
-    save_model_overview(model_config, model_overview_path)
+    save_model_overview(
+        model_config,
+        model_overview_path,
+        horizon_minutes=config.seizure_occurrence_period_minutes,
+    )
 
     for epoch in range(1, arguments.epochs + 1):
         train_sampler.set_epoch(epoch - 1)
@@ -793,6 +856,8 @@ def main() -> None:
         save_metrics(
             output_path=metrics_path,
             arguments=arguments,
+            normalization=normalization,
+            label_definition=label_definition,
             counts=counts,
             population_positive_fraction=population_positive_fraction,
             sampled_positive_fraction=sampled_positive_fraction,
@@ -829,7 +894,11 @@ def main() -> None:
         validation_prevalence,
         learning_curves_path,
     )
-    save_validation_summary(best_validation_result, validation_summary_path)
+    save_validation_summary(
+        best_validation_result,
+        validation_summary_path,
+        horizon_minutes=config.seizure_occurrence_period_minutes,
+    )
 
     print(f"Best validation AP: {best_average_precision:.6f} at epoch {best_epoch}")
     print(f"Checkpoint: {checkpoint_path}")

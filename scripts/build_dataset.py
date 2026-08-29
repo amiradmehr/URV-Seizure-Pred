@@ -4,6 +4,18 @@ Build the filtered, labeled, patient-level split SeizeIT2 dataset.
 Run from the repository root:
 
     python scripts/build_dataset.py
+
+By default this builds every combination of `INPUT_WINDOW_MINUTE_CHOICES` and
+`SEIZURE_OCCURRENCE_PERIOD_MINUTE_CHOICES`; `--windows` and `--horizons`
+narrow that.  Each combination gets its own tagged manifests and shards under
+`data/seizeit2/{interim,processed}/w{window}_h{horizon}/`.
+
+Only the decision indices and their labels differ between combinations, so
+each EDF is opened and filtered exactly once and every combination is labeled
+against that one in-memory copy.  The filtered EEG is written once to
+`data/seizeit2/interim/_shared/unscaled_recordings/` and shared by all of
+them, as are the fitted scalers.  Building twelve combinations therefore
+costs roughly the wall time and disk of building one.
 """
 
 from __future__ import annotations
@@ -11,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +38,13 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 
-from seizure_prediction.config import CONFIG  # noqa: E402
+from seizure_prediction.config import (  # noqa: E402
+    CONFIG,
+    INPUT_WINDOW_MINUTE_CHOICES,
+    SEIZURE_OCCURRENCE_PERIOD_MINUTE_CHOICES,
+    PreprocessingConfig,
+    sweep_configurations,
+)
 from seizure_prediction.normalization import (  # noqa: E402
     NORMALIZATION_MODES,
     STATISTICS,
@@ -41,18 +60,20 @@ from seizure_prediction.preprocessing import (  # noqa: E402
     clear_generated_directory,
     extract_recording_entities,
     filter_and_prepare,
+    filtered_recording_paths,
     find_events_file,
     infer_bte_side,
     load_bids_recordings,
+    load_filtered_recording,
     patient_class_summary,
     read_seizure_events,
     read_recording_events,
     recording_id_from_entities,
     normalize_entity,
-    save_unscaled_recording,
+    save_filtered_recording,
     seizure_scope_summary,
     verify_patient_split_isolation,
-    write_standardized_shards,
+    write_decision_shards,
     create_labeled_prediction_decisions,
 )
 
@@ -75,8 +96,10 @@ def parse_arguments() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help=(
-            "Reuse validated unscaled recording checkpoints and process only "
-            "missing or incomplete recordings."
+            "Reuse validated per-combination decision checkpoints and label "
+            "only the recordings still missing one. Cached filtered "
+            "recordings are reused either way, since they do not depend on "
+            "the window or horizon."
         ),
     )
     parser.add_argument(
@@ -100,73 +123,127 @@ def parse_arguments() -> argparse.Namespace:
             "wearable EEG."
         ),
     )
+    parser.add_argument(
+        "--windows",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "Input windows to build, in minutes (default: "
+            f"{' '.join(f'{value:g}' for value in INPUT_WINDOW_MINUTE_CHOICES)})."
+        ),
+    )
+    parser.add_argument(
+        "--horizons",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "Seizure occurrence periods to build, in minutes (default: "
+            f"{' '.join(f'{value:g}' for value in SEIZURE_OCCURRENCE_PERIOD_MINUTE_CHOICES)})."
+        ),
+    )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        default=None,
+        metavar="ID",
+        help=(
+            "Restrict the build to these subject IDs, without the 'sub-' "
+            "prefix (for example: 001 007 042). The full configured split is "
+            "used when omitted."
+        ),
+    )
     return parser.parse_args()
 
 
-def checkpoint_paths(recording_id: str) -> tuple[Path, Path, Path, Path]:
-    """Return the four required unscaled-recording checkpoint paths."""
-    directory = CONFIG.unscaled_recordings_dir
+def decision_checkpoint_paths(
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> tuple[Path, Path]:
+    """
+    Return the decision-checkpoint paths for one recording and label definition.
+
+    There is no signal checkpoint here.  The filtered EEG lives once in the
+    shared cache and is validated by `load_filtered_recording`; what is
+    checkpointed per combination is only the decision table it produced, which
+    is the part a different input window or horizon actually changes.  Because
+    these paths sit under the combination's own tag, resuming can never mix
+    decision rows built at one geometry into a build at another.
+    """
+    directory = config.decision_checkpoints_dir
     return (
-        directory / f"{recording_id}.npy",
         directory / f"{recording_id}.csv",
-        directory / f"{recording_id}_channels.json",
-        directory / f"{recording_id}_channel_availability.json",
+        directory / f"{recording_id}_seizures.csv",
     )
 
 
-def discard_checkpoint(recording_id: str) -> None:
-    """Remove only the known generated files for one incomplete recording."""
-    for checkpoint_path in checkpoint_paths(recording_id):
+def save_decision_checkpoint(
+    recording_id: str,
+    config: PreprocessingConfig,
+    decision_metadata: pd.DataFrame,
+    seizure_metadata: pd.DataFrame,
+) -> None:
+    """Save one recording's decisions and seizure eligibility for one tag."""
+    decision_path, seizure_path = decision_checkpoint_paths(recording_id, config)
+    decision_path.parent.mkdir(parents=True, exist_ok=True)
+    decision_metadata.to_csv(decision_path, index=False)
+    seizure_metadata.to_csv(seizure_path, index=False)
+
+
+def discard_decision_checkpoint(
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> None:
+    """Remove only the known generated files for one incomplete checkpoint."""
+    for checkpoint_path in decision_checkpoint_paths(recording_id, config):
         checkpoint_path.unlink(missing_ok=True)
 
 
-def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
-    """Return validated saved decision metadata, or discard a bad checkpoint."""
-    array_path, metadata_path, channels_path, availability_path = checkpoint_paths(
-        recording_id
-    )
-    paths = (array_path, metadata_path, channels_path, availability_path)
+def load_resumable_checkpoint(
+    recording_id: str,
+    config: PreprocessingConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """
+    Return validated saved decision and seizure metadata for one tag.
+
+    The geometry columns are checked against ``config``, so a checkpoint that
+    somehow predates a geometry change is discarded rather than silently
+    contributing decisions whose history length no longer matches the window
+    the model will read.
+    """
+    decision_path, seizure_path = decision_checkpoint_paths(recording_id, config)
+    paths = (decision_path, seizure_path)
 
     if not any(path.exists() for path in paths):
         return None
+
+    entity_dtypes = {
+        "recording_id": str,
+        "subject": str,
+        "session": str,
+        "task": str,
+        "run": str,
+    }
 
     try:
         if not all(path.exists() for path in paths):
             raise ValueError("one or more required checkpoint files are missing")
 
-        signal = np.load(array_path, mmap_mode="r")
-        if signal.ndim != 2 or signal.shape[0] != len(CONFIG.canonical_channel_names):
-            raise ValueError(f"unexpected signal shape {signal.shape}")
-        if signal.shape[1] <= 0:
-            raise ValueError("recording contains no samples")
-        if not np.isfinite(signal[:, [0, -1]]).all():
-            raise ValueError("recording endpoint contains a non-finite value")
-        del signal
+        metadata = pd.read_csv(decision_path, dtype=entity_dtypes)
+        seizure_metadata = pd.read_csv(seizure_path, dtype=entity_dtypes)
 
-        with channels_path.open("r", encoding="utf-8") as channel_file:
-            channel_names = json.load(channel_file)
-        if channel_names != list(CONFIG.canonical_channel_names):
-            raise ValueError(f"unexpected channel layout {channel_names}")
-
-        with availability_path.open("r", encoding="utf-8") as availability_file:
-            availability = np.asarray(json.load(availability_file), dtype=np.int8)
-        if availability.shape != (len(CONFIG.canonical_channel_names),) or not np.isin(
-            availability,
-            [0, 1],
-        ).all():
-            raise ValueError(f"invalid availability mask {availability.tolist()}")
-
-        metadata = pd.read_csv(
-            metadata_path,
-            dtype={
-                "recording_id": str,
-                "subject": str,
-                "session": str,
-                "task": str,
-                "run": str,
-            },
-        )
-        required_columns = {"recording_id", "label", "target_seizure_id"}
+        required_columns = {
+            "recording_id",
+            "label",
+            "target_seizure_id",
+            "history_start_sample",
+            "decision_end_sample",
+            "chunk_samples",
+            "chunks_per_history",
+        }
         missing_columns = required_columns - set(metadata.columns)
         if metadata.empty or missing_columns:
             raise ValueError(
@@ -178,46 +255,42 @@ def load_resumable_checkpoint(recording_id: str) -> pd.DataFrame | None:
         if not metadata["label"].isin([0, 1]).all():
             raise ValueError("metadata contains invalid labels")
 
-        return metadata
+        expected_chunk_samples = int(
+            round(config.chunk_window_seconds * config.target_sfreq)
+        )
+        expected_history_samples = int(
+            round(config.input_window_seconds * config.target_sfreq)
+        )
+        expected_chunks = expected_history_samples // expected_chunk_samples
+
+        if not metadata["chunk_samples"].eq(expected_chunk_samples).all():
+            raise ValueError("checkpoint chunk_samples does not match the config")
+        if not metadata["chunks_per_history"].eq(expected_chunks).all():
+            raise ValueError("checkpoint chunks_per_history does not match the config")
+
+        history_lengths = (
+            metadata["decision_end_sample"] - metadata["history_start_sample"]
+        )
+        if not history_lengths.eq(expected_history_samples).all():
+            raise ValueError(
+                "checkpoint decision history length does not match the "
+                f"configured {config.input_window_seconds / 60.0:g}-minute window"
+            )
+
+        return metadata, seizure_metadata
     except (ValueError, KeyError, json.JSONDecodeError, EOFError) as error:
-        discard_checkpoint(recording_id)
-        print(f"    Discarded incomplete checkpoint: {error}")
+        discard_decision_checkpoint(recording_id, config)
+        print(f"      Discarded incomplete checkpoint: {error}")
         return None
     except OSError as error:
         raise RuntimeError(
             "Could not read an existing checkpoint; it was left untouched. "
-            f"Resolve the filesystem error and retry: {array_path} ({error})"
+            f"Resolve the filesystem error and retry: {decision_path} ({error})"
         ) from error
 
 
-def seizure_metadata_from_resumed_checkpoint(
-    seizure_events: pd.DataFrame,
-    decision_metadata: pd.DataFrame,
-) -> pd.DataFrame:
-    """Mark target seizures known eligible from an already saved checkpoint."""
-    resumed_seizures = seizure_events.copy()
-    known_targets = set(
-        decision_metadata.loc[
-            decision_metadata["label"] == 1,
-            "target_seizure_id",
-        ]
-        .dropna()
-        .astype(str)
-    )
-    # A saved positive decision proves its target passed the clear-history
-    # eligibility check. Other seizures are deliberately left unknown rather
-    # than incorrectly marking them ineligible without rereading their EEG.
-    resumed_seizures["eligible_for_prediction"] = pd.NA
-    resumed_seizures.loc[
-        resumed_seizures["seizure_id"].astype(str).isin(known_targets),
-        "eligible_for_prediction",
-    ] = True
-    resumed_seizures["eligibility_evaluated"] = False
-    return resumed_seizures
-
-
 def fit_scalers_for_build(
-    metadata: pd.DataFrame,
+    recordings: pd.DataFrame,
     mode: str,
     statistic: str,
 ) -> dict:
@@ -227,12 +300,13 @@ def fit_scalers_for_build(
     original train/validation/test asymmetry. ``patient`` and ``recording`` fit
     each group from its own recordings, so validation and test patients are
     normalized by their own statistics and never by another patient's.
+
+    The fit reads whole filtered recordings and so does not depend on the
+    input window or the seizure occurrence period.  ``recordings`` is
+    therefore the union of every recording any combination in this build
+    kept, and the resulting document is shared by all of them.
     """
-    recordings = (
-        metadata[["subject", "recording_id", "split"]]
-        .drop_duplicates(subset="recording_id")
-        .copy()
-    )
+    recordings = recordings.drop_duplicates(subset="recording_id").copy()
     recordings["subject"] = recordings["subject"].map(normalize_entity)
 
     if mode == "global":
@@ -244,7 +318,10 @@ def fit_scalers_for_build(
 
     availability_by_path: dict[Path, np.ndarray] = {}
     for recording_id in contributing["recording_id"]:
-        array_path, _, _, availability_path = checkpoint_paths(str(recording_id))
+        array_path, _, availability_path, _ = filtered_recording_paths(
+            CONFIG.unscaled_recordings_dir,
+            str(recording_id),
+        )
         with availability_path.open("r", encoding="utf-8") as availability_file:
             availability_by_path[array_path] = np.asarray(
                 json.load(availability_file),
@@ -266,7 +343,10 @@ def fit_scalers_for_build(
     groups = list(contributing.groupby("scaler_key", sort=True))
     for group_number, (scaler_key, group) in enumerate(groups, start=1):
         array_paths = [
-            checkpoint_paths(str(recording_id))[0]
+            filtered_recording_paths(
+                CONFIG.unscaled_recordings_dir,
+                str(recording_id),
+            )[0]
             for recording_id in group["recording_id"]
         ]
         scalers[scaler_key] = fit_channel_scaler(
@@ -297,7 +377,7 @@ def fit_scalers_for_build(
                 f"No {mode} scaler was fitted for: {uncovered[:5]}"
             )
 
-    return build_scaler_document(
+    document = build_scaler_document(
         mode=mode,
         statistic=statistic,
         channel_names=list(CONFIG.canonical_channel_names),
@@ -307,423 +387,501 @@ def fit_scalers_for_build(
             sorted(set(contributing["subject"])) if mode == "global" else None
         ),
     )
-
-
-def main() -> None:
-    """Execute the complete preprocessing workflow."""
-    arguments = parse_arguments()
-    CONFIG.validate()
-
-    print_header("SEIZEIT2 PREPROCESSING PIPELINE")
-
-    print(f"Project root:       {CONFIG.project_root}")
-    print(f"Raw dataset:        {CONFIG.raw_data_dir}")
-    print(f"Interim output:     {CONFIG.interim_data_dir}")
-    print(f"Processed output:   {CONFIG.processed_data_dir}")
-    print(
-        "Subjects:           "
-        f"{len(CONFIG.included_subjects)} configured "
-        "patient-level subjects"
+    # Recorded so a later build can tell whether this shared document already
+    # covers the recordings it needs, or has to be refitted because a shorter
+    # window kept a recording that no earlier combination did.
+    document["covered_recording_ids"] = sorted(
+        str(recording_id) for recording_id in recordings["recording_id"]
     )
+    return document
 
-    if arguments.resume:
-        CONFIG.unscaled_recordings_dir.mkdir(parents=True, exist_ok=True)
-        print("Resume mode: validated existing recordings will be reused.")
-    else:
-        clear_generated_directory(CONFIG.unscaled_recordings_dir)
 
-    # Final shards and aggregate manifests are rebuilt from the complete
-    # checkpoint set after pass 1, whether this is a fresh run or a resume.
-    clear_generated_directory(
-        CONFIG.processed_data_dir
-    )
+def load_reusable_scaler_document(
+    scaler_path: Path,
+    required_recording_ids: set[str],
+    mode: str,
+    statistic: str,
+) -> dict | None:
+    """
+    Return a previously fitted shared scaler document, if it still applies.
 
-    clear_generated_directory(CONFIG.manifests_dir)
+    Fitting reads every filtered recording end to end, so reusing the document
+    across combinations saves a full pass over the whole dataset per
+    combination.  It is only safe when the saved document covers every
+    recording this build needs; a shorter window keeps recordings a longer one
+    was too short for, so coverage genuinely can grow between combinations.
+    """
+    if not scaler_path.exists():
+        return None
 
-    CONFIG.scaler_parameters_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    try:
+        with scaler_path.open("r", encoding="utf-8") as scaler_file:
+            document = json.load(scaler_file)
+    except (OSError, json.JSONDecodeError):
+        return None
 
-    recordings = load_bids_recordings(
-        config=CONFIG,
-        subjects=CONFIG.included_subjects,
-        preload=False,
-    )
-
-    print(
-        f"\nEDF recordings found: "
-        f"{len(recordings)}"
-    )
-
-    loaded_subjects = {
-        extract_recording_entities(recording.description)["subject"]
-        for recording in recordings
-    }
-    missing_subjects = sorted(set(CONFIG.included_subjects) - loaded_subjects)
-
-    if missing_subjects:
-        raise RuntimeError(
-            "The configured patient split includes subjects with no loaded "
-            f"EEG recordings: {missing_subjects}"
-        )
-
-    all_decision_metadata: list[pd.DataFrame] = []
-    all_seizure_metadata: list[pd.DataFrame] = []
-    reused_recordings = 0
-    rebuilt_recordings = 0
-
-    # ------------------------------------------------------------------
-    # Pass 1: Filter at 256 Hz, create decisions, and save recordings.
-    # ------------------------------------------------------------------
-
-    print_header("PASS 1: NATIVE-RATE FILTERING AND WINDOW GENERATION")
-
-    for recording_number, recording in enumerate(
-        recordings,
-        start=1,
+    if (
+        document.get("normalization_mode") != mode
+        or document.get("statistic") != statistic
     ):
-        entities = extract_recording_entities(
-            recording.description
-        )
+        return None
 
-        recording_id = recording_id_from_entities(
-            entities
-        )
+    covered = set(document.get("covered_recording_ids", []))
 
-        print(
-            f"[{recording_number:03d}/"
-            f"{len(recordings):03d}] "
-            f"{recording_id}"
-        )
+    if not required_recording_ids.issubset(covered):
+        return None
 
-        resumed_metadata = (
-            load_resumable_checkpoint(recording_id)
-            if arguments.resume
-            else None
-        )
+    return document
 
-        if resumed_metadata is not None:
-            events_path = find_events_file(
-                dataset_root=CONFIG.raw_data_dir,
-                entities=entities,
-            )
-            seizure_events = read_seizure_events(
-                events_path=events_path,
-                entities=entities,
-            )
-            all_decision_metadata.append(resumed_metadata)
-            if not seizure_events.empty:
-                all_seizure_metadata.append(
-                    seizure_metadata_from_resumed_checkpoint(
-                        seizure_events,
-                        resumed_metadata,
-                    )
-                )
-            reused_recordings += 1
-            print(
-                "    Reused validated checkpoint: "
-                f"{len(resumed_metadata)} decision points."
-            )
-            continue
 
-        events_path = find_events_file(
-            dataset_root=CONFIG.raw_data_dir,
-            entities=entities,
-        )
+def label_recording_for_combination(
+    processed_raw,
+    seizure_events: pd.DataFrame,
+    recording_events: pd.DataFrame,
+    entities: dict[str, str],
+    bte_side: str,
+    config: PreprocessingConfig,
+    recording_id: str,
+    resume: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Produce one combination's decisions for an already filtered recording.
 
-        seizure_events = read_seizure_events(
-            events_path=events_path,
-            entities=entities,
-        )
-        recording_events = read_recording_events(events_path)
+    Returns the decision table and the seizure table carrying this
+    combination's eligibility verdicts.  Both are checkpointed under the
+    combination's tag so a later resume skips the labeling scan.
+    """
+    if resume:
+        resumed = load_resumable_checkpoint(recording_id, config)
+        if resumed is not None:
+            return resumed
 
-        raw = recording.load_raw()
-        bte_side = infer_bte_side(raw)
-        availability = channel_availability_mask(raw, CONFIG)
-
-        processed_raw = filter_and_prepare(
-            raw=raw,
-            config=CONFIG,
-        )
-        del raw
-
-        metadata_recording, seizure_metadata_recording = (
-            create_labeled_prediction_decisions(
-                raw=processed_raw,
-                seizure_events=seizure_events,
-                recording_events=recording_events,
-                entities=entities,
-                bte_side=bte_side,
-                config=CONFIG,
-            )
-        )
-
-        if not seizure_metadata_recording.empty:
-            seizure_metadata_recording["eligibility_evaluated"] = True
-            all_seizure_metadata.append(seizure_metadata_recording)
-
-        rebuilt_recordings += 1
-
-        print(
-            f"    Channels: {processed_raw.ch_names}"
-        )
-        print(f"    Availability mask: {availability.astype(int).tolist()}")
-        print(
-            f"    Sampling frequency: "
-            f"{processed_raw.info['sfreq']} Hz"
-        )
-        print(
-            f"    Seizures in recording: "
-            f"{len(seizure_events)}"
-        )
-        print(
-            f"    Retained decision points: "
-            f"{len(metadata_recording)}"
-        )
-
-        if metadata_recording.empty:
-            print(
-                "    No usable decision points; recording skipped."
-            )
-            continue
-
-        save_unscaled_recording(
-            signal=processed_raw.get_data().astype(
-                CONFIG.signal_dtype,
-                copy=False,
-            ),
-            decision_metadata=metadata_recording,
-            channel_names=processed_raw.ch_names,
-            channel_availability=availability,
-            output_directory=(
-                CONFIG.unscaled_recordings_dir
-            ),
-            recording_id=recording_id,
-        )
-
-        all_decision_metadata.append(
-            metadata_recording
-        )
-
-        # Explicitly release potentially large objects.
-        del processed_raw
-        del metadata_recording
-
-    if arguments.resume:
-        print(
-            "\nResume result: "
-            f"reused {reused_recordings} recordings; "
-            f"processed {rebuilt_recordings} recordings."
-        )
-
-    if not all_decision_metadata:
-        raise RuntimeError(
-            "No usable prediction decision points were generated."
-        )
-
-    window_metadata = pd.concat(
-        all_decision_metadata,
-        ignore_index=True,
+    decision_metadata, seizure_metadata = create_labeled_prediction_decisions(
+        raw=processed_raw,
+        seizure_events=seizure_events,
+        recording_events=recording_events,
+        entities=entities,
+        bte_side=bte_side,
+        config=config,
     )
 
-    if all_seizure_metadata:
-        seizure_metadata = pd.concat(
-            all_seizure_metadata,
-            ignore_index=True,
-        )
-    else:
-        seizure_metadata = pd.DataFrame()
+    if not seizure_metadata.empty:
+        seizure_metadata = seizure_metadata.copy()
+        seizure_metadata["eligibility_evaluated"] = True
 
-    # ------------------------------------------------------------------
-    # Pass 2: Fixed patient-level splitting.
-    # ------------------------------------------------------------------
-
-    print_header("PASS 2: PATIENT-LEVEL SPLITTING")
-
-    window_metadata = (
-        assign_patient_splits(
-            metadata=window_metadata,
-            config=CONFIG,
-        )
+    save_decision_checkpoint(
+        recording_id=recording_id,
+        config=config,
+        decision_metadata=decision_metadata,
+        seizure_metadata=seizure_metadata,
     )
 
-    verify_patient_split_isolation(window_metadata, CONFIG)
+    return decision_metadata, seizure_metadata
 
-    window_manifest_path = (
-        CONFIG.manifests_dir
-        / "decision_manifest.csv"
+
+def build_combination_outputs(
+    config: PreprocessingConfig,
+    decision_metadata: pd.DataFrame,
+    seizure_metadata: pd.DataFrame,
+    scaler_document: dict,
+    scaler_document_path: Path,
+) -> dict[str, Path]:
+    """
+    Write one combination's splits, manifests, and decision shards.
+
+    No EEG is written here.  Every shard references the shared filtered
+    recording, and standardization happens when a decision is loaded.
+    """
+    decision_metadata = assign_patient_splits(
+        metadata=decision_metadata,
+        config=config,
     )
 
-    seizure_manifest_path = (
-        CONFIG.manifests_dir
-        / "seizure_manifest.csv"
+    verify_patient_split_isolation(decision_metadata, config)
+
+    decision_manifest_path = config.manifests_dir / "decision_manifest.csv"
+    seizure_manifest_path = config.manifests_dir / "seizure_manifest.csv"
+    patient_summary_path = config.manifests_dir / "patient_class_summary.csv"
+    processed_manifest_path = config.manifests_dir / "processed_shard_manifest.csv"
+
+    decision_metadata.to_csv(decision_manifest_path, index=False)
+    seizure_metadata.to_csv(seizure_manifest_path, index=False)
+
+    patient_summary = patient_class_summary(decision_metadata)
+    patient_summary.to_csv(patient_summary_path, index=False)
+
+    processed_manifest = write_decision_shards(
+        metadata=decision_metadata,
+        unscaled_recordings_dir=config.unscaled_recordings_dir,
+        processed_data_dir=config.processed_data_dir,
+        scaler_document=scaler_document,
+        scaler_document_path=scaler_document_path,
+        project_root=config.project_root,
     )
 
-    window_metadata.to_csv(
-        window_manifest_path,
-        index=False,
-    )
+    processed_manifest.to_csv(processed_manifest_path, index=False)
 
-    seizure_metadata.to_csv(
-        seizure_manifest_path,
-        index=False,
-    )
-
-    print("\nDecision class counts:")
+    print("\n  Decision class counts:")
     print(
-        class_summary(window_metadata).to_string(
-            index=False
+        textwrap.indent(
+            class_summary(decision_metadata).to_string(index=False),
+            "    ",
         )
     )
 
-    print("\nPositive-decision seizure-scope counts:")
-    scope_summary = seizure_scope_summary(
-        window_metadata
-    )
+    scope_summary = seizure_scope_summary(decision_metadata)
 
+    print("\n  Positive-decision seizure-scope counts:")
     if scope_summary.empty:
-        print("No positive decisions were generated.")
+        print("    No positive decisions were generated.")
     else:
-        print(
-            scope_summary.to_string(
-                index=False
-            )
-        )
+        print(textwrap.indent(scope_summary.to_string(index=False), "    "))
 
     unknown_positive_count = int(
         (
-            (window_metadata["label"] == 1)
-            & (
-                window_metadata["seizure_scope"]
-                == "unknown"
-            )
+            (decision_metadata["label"] == 1)
+            & (decision_metadata["seizure_scope"] == "unknown")
         ).sum()
     )
 
     if unknown_positive_count > 0:
         print(
-            "\nWARNING: "
-            f"{unknown_positive_count} positive decisions have "
-            "unknown local/cross scope. The event files did not "
-            "contain a recognized authoritative scope column. "
-            "Do not guess these labels; add them from the trusted "
-            "SeizeIT2 annotation source."
+            "\n  WARNING: "
+            f"{unknown_positive_count} positive decisions have unknown "
+            "local/cross scope. The event files did not contain a recognized "
+            "authoritative scope column. Do not guess these labels; add them "
+            "from the trusted SeizeIT2 annotation source."
         )
-
-    # ------------------------------------------------------------------
-    # Pass 3: Fit the channel scalers at the requested scope.
-    # ------------------------------------------------------------------
-
-    print_header(
-        f"PASS 3: {arguments.normalization.upper()} "
-        f"{arguments.statistic.upper()} SCALER FITTING"
-    )
-
-    scaler_document = fit_scalers_for_build(
-        metadata=window_metadata,
-        mode=arguments.normalization,
-        statistic=arguments.statistic,
-    )
-
-    patient_summary = patient_class_summary(window_metadata)
-    patient_summary_path = (
-        CONFIG.manifests_dir
-        / "patient_class_summary.csv"
-    )
-    patient_summary.to_csv(patient_summary_path, index=False)
-
-    print("\nPatient-level class counts:")
-    print(patient_summary.to_string(index=False))
-
-    scaler_path = (
-        CONFIG.scaler_parameters_dir
-        / "channel_scalers.json"
-    )
-
-    save_scaler_document(scaler_document, scaler_path)
-
-    print(
-        f"\nFitted {scaler_document['scaler_count']} "
-        f"{arguments.normalization} scaler(s) "
-        f"({arguments.statistic}) over "
-        f"{scaler_document['fitted_on']}."
-    )
-    if scaler_document["non_causal_statistics"]:
-        print(
-            "Note: these statistics summarize whole recordings, so the "
-            "scaling of an early decision reflects later samples. A deployed "
-            "system would calibrate on a prefix instead."
-        )
-    print(f"Scaler file: {scaler_path}")
-
-    # ------------------------------------------------------------------
-    # Pass 4: Apply train-fitted scaling and save final shards.
-    # ------------------------------------------------------------------
-
-    print_header("PASS 4: FINAL STANDARDIZED DATASET")
-
-    processed_manifest = write_standardized_shards(
-        metadata=window_metadata,
-        unscaled_recordings_dir=(
-            CONFIG.unscaled_recordings_dir
-        ),
-        processed_data_dir=(
-            CONFIG.processed_data_dir
-        ),
-        scaler_document=scaler_document,
-        output_dtype=CONFIG.signal_dtype,
-    )
-
-    processed_manifest_path = (
-        CONFIG.manifests_dir
-        / "processed_shard_manifest.csv"
-    )
-
-    processed_manifest.to_csv(
-        processed_manifest_path,
-        index=False,
-    )
-
-    print("\nProcessed shard summary:")
 
     summary = (
         processed_manifest.groupby("split")
         .agg(
             shards=("recording_id", "count"),
             decisions=("number_of_decisions", "sum"),
-            positive_decisions=(
-                "number_of_positive_decisions",
-                "sum",
-            ),
-            negative_decisions=(
-                "number_of_negative_decisions",
-                "sum",
-            ),
+            positive_decisions=("number_of_positive_decisions", "sum"),
+            negative_decisions=("number_of_negative_decisions", "sum"),
         )
         .reset_index()
     )
 
-    print(summary.to_string(index=False))
+    print("\n  Decision shard summary:")
+    print(textwrap.indent(summary.to_string(index=False), "    "))
+
+    return {
+        "decision_manifest": decision_manifest_path,
+        "seizure_manifest": seizure_manifest_path,
+        "patient_summary": patient_summary_path,
+        "processed_manifest": processed_manifest_path,
+    }
+
+
+def main() -> None:
+    """Execute the complete preprocessing workflow for every combination."""
+    arguments = parse_arguments()
+    CONFIG.validate()
+
+    configs = sweep_configurations(
+        input_window_minutes=arguments.windows,
+        seizure_occurrence_period_minutes=arguments.horizons,
+    )
+
+    subjects = (
+        tuple(CONFIG.included_subjects)
+        if arguments.subjects is None
+        else tuple(normalize_entity(subject) for subject in arguments.subjects)
+    )
+
+    print_header("SEIZEIT2 PREPROCESSING PIPELINE")
+
+    print(f"Project root:       {CONFIG.project_root}")
+    print(f"Raw dataset:        {CONFIG.raw_data_dir}")
+    print(f"Shared recordings:  {CONFIG.unscaled_recordings_dir}")
+    print(f"Shared scalers:     {CONFIG.scaler_parameters_dir}")
+    print(f"Subjects:           {len(subjects)} patient-level subjects")
+    print(
+        "Combinations:       "
+        f"{len(configs)} "
+        f"({', '.join(config.experiment_tag for config in configs)})"
+    )
+    print(
+        "\nThe filtered EEG is written once and shared by every combination; "
+        "only\ndecision indices and labels are built per combination."
+    )
+
+    CONFIG.unscaled_recordings_dir.mkdir(parents=True, exist_ok=True)
+    CONFIG.scaler_parameters_dir.mkdir(parents=True, exist_ok=True)
+
+    for config in configs:
+        # Manifests and shards are always rebuilt from the complete checkpoint
+        # set, whether this is a fresh run or a resume. The shared filtered
+        # recordings and scalers are never cleared.
+        clear_generated_directory(config.processed_data_dir)
+        clear_generated_directory(config.manifests_dir)
+
+        if arguments.resume:
+            config.decision_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            clear_generated_directory(config.decision_checkpoints_dir)
+
+    if arguments.resume:
+        print("\nResume mode: validated existing checkpoints will be reused.")
+
+    recordings = load_bids_recordings(
+        config=CONFIG,
+        subjects=subjects,
+        preload=False,
+    )
+
+    print(f"\nEDF recordings found: {len(recordings)}")
+
+    loaded_subjects = {
+        extract_recording_entities(recording.description)["subject"]
+        for recording in recordings
+    }
+    missing_subjects = sorted(set(subjects) - loaded_subjects)
+
+    if missing_subjects:
+        raise RuntimeError(
+            "The requested subjects include ones with no loaded EEG "
+            f"recordings: {missing_subjects}"
+        )
+
+    decision_metadata_by_tag: dict[str, list[pd.DataFrame]] = {
+        config.experiment_tag: [] for config in configs
+    }
+    seizure_metadata_by_tag: dict[str, list[pd.DataFrame]] = {
+        config.experiment_tag: [] for config in configs
+    }
+    kept_recordings: list[dict[str, str]] = []
+    reused_recordings = 0
+    filtered_recordings = 0
+
+    # ------------------------------------------------------------------
+    # Pass 1: Filter each EDF once, then label it for every combination.
+    # ------------------------------------------------------------------
+
+    print_header("PASS 1: NATIVE-RATE FILTERING AND DECISION LABELING")
+
+    for recording_number, recording in enumerate(recordings, start=1):
+        entities = extract_recording_entities(recording.description)
+        recording_id = recording_id_from_entities(entities)
+
+        print(f"[{recording_number:04d}/{len(recordings):04d}] {recording_id}")
+
+        events_path = find_events_file(
+            dataset_root=CONFIG.raw_data_dir,
+            entities=entities,
+        )
+        seizure_events = read_seizure_events(
+            events_path=events_path,
+            entities=entities,
+        )
+        recording_events = read_recording_events(events_path)
+
+        cached = load_filtered_recording(
+            CONFIG.unscaled_recordings_dir,
+            recording_id,
+            CONFIG,
+        )
+
+        if cached is not None:
+            processed_raw, bte_side, availability = cached
+            reused_recordings += 1
+            print("    Reused shared filtered recording.")
+        else:
+            raw = recording.load_raw()
+            bte_side = infer_bte_side(raw)
+            availability = channel_availability_mask(raw, CONFIG)
+
+            processed_raw = filter_and_prepare(raw=raw, config=CONFIG)
+            del raw
+
+            save_filtered_recording(
+                raw=processed_raw,
+                channel_availability=availability,
+                bte_side=bte_side,
+                output_directory=CONFIG.unscaled_recordings_dir,
+                recording_id=recording_id,
+                output_dtype=CONFIG.signal_dtype,
+            )
+            filtered_recordings += 1
+
+            print(f"    Channels: {processed_raw.ch_names}")
+            print(f"    Availability mask: {availability.astype(int).tolist()}")
+            print(f"    Sampling frequency: {processed_raw.info['sfreq']} Hz")
+
+        print(f"    Seizures in recording: {len(seizure_events)}")
+
+        kept_for_any_combination = False
+
+        for config in configs:
+            decision_metadata, seizure_metadata = label_recording_for_combination(
+                processed_raw=processed_raw,
+                seizure_events=seizure_events,
+                recording_events=recording_events,
+                entities=entities,
+                bte_side=bte_side,
+                config=config,
+                recording_id=recording_id,
+                resume=arguments.resume,
+            )
+
+            eligible_count = (
+                int(
+                    seizure_metadata["eligible_for_prediction"]
+                    .fillna(False)
+                    .astype(bool)
+                    .sum()
+                )
+                if "eligible_for_prediction" in seizure_metadata.columns
+                and not seizure_metadata.empty
+                else 0
+            )
+
+            print(
+                f"    {config.experiment_tag:>8}: "
+                f"{len(decision_metadata):6d} decisions, "
+                f"{int(decision_metadata['label'].sum()) if not decision_metadata.empty else 0:4d} positive, "
+                f"{eligible_count} eligible seizure(s)"
+            )
+
+            if decision_metadata.empty:
+                continue
+
+            kept_for_any_combination = True
+            decision_metadata_by_tag[config.experiment_tag].append(decision_metadata)
+
+            if not seizure_metadata.empty:
+                seizure_metadata_by_tag[config.experiment_tag].append(seizure_metadata)
+
+        if kept_for_any_combination:
+            kept_recordings.append(
+                {
+                    "recording_id": recording_id,
+                    "subject": entities["subject"],
+                }
+            )
+        else:
+            print("    No usable decision points for any combination.")
+
+        # Explicitly release potentially large objects.
+        del processed_raw
+
+    print(
+        f"\nFiltering result: reused {reused_recordings} cached recording(s); "
+        f"filtered {filtered_recordings} recording(s)."
+    )
+
+    if not kept_recordings:
+        raise RuntimeError("No usable prediction decision points were generated.")
+
+    # ------------------------------------------------------------------
+    # Pass 2: Fit the channel scalers once for the whole sweep.
+    # ------------------------------------------------------------------
+
+    print_header(
+        f"PASS 2: {arguments.normalization.upper()} "
+        f"{arguments.statistic.upper()} SCALER FITTING"
+    )
+
+    kept_frame = pd.DataFrame(kept_recordings).drop_duplicates(
+        subset="recording_id"
+    )
+    kept_frame["split"] = kept_frame["subject"].map(CONFIG.subject_split_map)
+
+    if kept_frame["split"].isna().any():
+        unmapped = sorted(
+            kept_frame.loc[kept_frame["split"].isna(), "subject"].unique()
+        )
+        raise ValueError(
+            f"These subjects are not in any configured split: {unmapped}"
+        )
+
+    scaler_path = CONFIG.scaler_document_path(
+        arguments.normalization,
+        arguments.statistic,
+    )
+
+    scaler_document = load_reusable_scaler_document(
+        scaler_path=scaler_path,
+        required_recording_ids=set(kept_frame["recording_id"]),
+        mode=arguments.normalization,
+        statistic=arguments.statistic,
+    )
+
+    if scaler_document is None:
+        scaler_document = fit_scalers_for_build(
+            recordings=kept_frame,
+            mode=arguments.normalization,
+            statistic=arguments.statistic,
+        )
+        save_scaler_document(scaler_document, scaler_path)
+        print(
+            f"\nFitted {scaler_document['scaler_count']} "
+            f"{arguments.normalization} scaler(s) "
+            f"({arguments.statistic}) over {scaler_document['fitted_on']}."
+        )
+    else:
+        print(
+            f"\nReused {scaler_document['scaler_count']} cached "
+            f"{arguments.normalization} scaler(s) ({arguments.statistic}); "
+            "the saved document already covers every recording in this build."
+        )
+
+    if scaler_document["non_causal_statistics"]:
+        print(
+            "Note: these statistics summarize whole recordings, so the "
+            "scaling of an early decision reflects later samples. A deployed "
+            "system would calibrate on a prefix instead."
+        )
+
+    print(f"Scaler file: {scaler_path}")
+
+    # ------------------------------------------------------------------
+    # Pass 3: Split, manifest, and shard each combination.
+    # ------------------------------------------------------------------
+
+    output_paths_by_tag: dict[str, dict[str, Path]] = {}
+
+    for config in configs:
+        print_header(f"PASS 3: DECISION SHARDS FOR {config.experiment_tag}")
+
+        tag_decisions = decision_metadata_by_tag[config.experiment_tag]
+
+        if not tag_decisions:
+            raise RuntimeError(
+                "No usable prediction decision points were generated for "
+                f"{config.experiment_tag}."
+            )
+
+        tag_seizures = seizure_metadata_by_tag[config.experiment_tag]
+
+        output_paths_by_tag[config.experiment_tag] = build_combination_outputs(
+            config=config,
+            decision_metadata=pd.concat(tag_decisions, ignore_index=True),
+            seizure_metadata=(
+                pd.concat(tag_seizures, ignore_index=True)
+                if tag_seizures
+                else pd.DataFrame()
+            ),
+            scaler_document=scaler_document,
+            scaler_document_path=scaler_path,
+        )
 
     print_header("PREPROCESSING COMPLETE")
 
-    print(f"Decision manifest:  {window_manifest_path}")
-    print(f"Patient summary:    {patient_summary_path}")
-    print(f"Seizure manifest:   {seizure_manifest_path}")
+    print(f"Shared recordings:  {CONFIG.unscaled_recordings_dir}")
     print(f"Scaler parameters:  {scaler_path}")
-    print(
-        f"Processed manifest: "
-        f"{processed_manifest_path}"
-    )
-    print(
-        f"Processed data:     "
-        f"{CONFIG.processed_data_dir}"
-    )
+    print("\nPer-combination output:")
+
+    for config in configs:
+        print(f"  {config.experiment_tag:>8}: {config.processed_data_dir}")
 
     print(
         "\nNext command:\n"
-        "    python scripts/validate_dataset.py"
+        "    python scripts/validate_dataset.py "
+        f"--window-minutes {configs[0].input_window_seconds / 60.0:g} "
+        f"--horizon-minutes {configs[0].seizure_occurrence_period_minutes:g}"
     )
 
 
