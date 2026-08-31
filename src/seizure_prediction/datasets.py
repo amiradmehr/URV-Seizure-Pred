@@ -315,3 +315,91 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
             ),
             torch.tensor(float(row["label"]), dtype=torch.float32),
         )
+
+
+class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    """Serve a decision as its precomputed chunk-feature sequence.
+
+    Reads the ``(n_chunks, n_features)`` bank produced by build_features.py and
+    slices the 540 chunks covering one 45-minute history. That is 58 KB per
+    decision against 8.3 MB of raw EEG, which is what turns training from an I/O
+    pipeline into a compute one and makes cross-validation affordable.
+
+    Windows are centred and scaled on their own median/IQR. In log-power space a
+    per-patient amplitude gain is a constant offset, so this removes it exactly
+    rather than estimating it -- see seizure_prediction.features.
+    """
+
+    def __init__(
+        self,
+        examples: pd.DataFrame,
+        config: PreprocessingConfig,
+        feature_dir: Path,
+        normalize: bool = True,
+    ) -> None:
+        self.examples = examples.reset_index(drop=True)
+        self.config = config
+        self.feature_dir = Path(feature_dir)
+        self.normalize = normalize
+        self._cache: dict[str, np.ndarray] = {}
+        self._availability_cache: dict[str, np.ndarray] = {}
+
+        self.chunk_samples = int(
+            round(config.chunk_window_seconds * config.target_sfreq)
+        )
+        self.n_chunks = int(
+            round(config.input_window_seconds / config.chunk_window_seconds)
+        )
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_cache"] = {}
+        state["_availability_cache"] = {}
+        return state
+
+    def _bank(self, recording_id: str) -> tuple[np.ndarray, np.ndarray]:
+        if recording_id not in self._cache:
+            path = self.feature_dir / f"{recording_id}_features.npy"
+            availability_path = self.feature_dir / f"{recording_id}_availability.npy"
+            self._cache[recording_id] = np.load(path, mmap_mode="r")
+            self._availability_cache[recording_id] = np.load(availability_path)
+        return self._cache[recording_id], self._availability_cache[recording_id]
+
+    def __getitem__(
+        self,
+        index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from seizure_prediction.features import normalize_window
+
+        row = self.examples.iloc[index]
+        bank, availability_columns = self._bank(str(row["recording_id"]))
+
+        # Chunk grid is aligned to the recording start, so the history's first
+        # chunk index follows directly from its first sample.
+        start = int(row["history_start_sample"]) // self.chunk_samples
+        stop = start + self.n_chunks
+        if stop > bank.shape[0]:
+            # A recording whose trailing partial chunk was dropped can fall one
+            # short; pad by repeating the last chunk rather than failing.
+            window = np.asarray(bank[start:], dtype=np.float32)
+            if window.shape[0] == 0:
+                window = np.zeros((self.n_chunks, bank.shape[1]), dtype=np.float32)
+            else:
+                pad = self.n_chunks - window.shape[0]
+                window = np.concatenate(
+                    [window, np.repeat(window[-1:], pad, axis=0)], axis=0
+                )
+        else:
+            window = np.asarray(bank[start:stop], dtype=np.float32)
+
+        if self.normalize:
+            window = normalize_window(window, availability_columns)
+
+        return (
+            torch.from_numpy(np.ascontiguousarray(window)),
+            torch.from_numpy(availability_columns.astype(np.float32)),
+            torch.tensor(float(row["label"]), dtype=torch.float32),
+        )

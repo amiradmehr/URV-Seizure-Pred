@@ -319,3 +319,137 @@ class EEGNetAttentionRiskModel(nn.Module):
     ) -> torch.Tensor:
         """Return the model's uncalibrated next-10-minute seizure probability."""
         return torch.sigmoid(self(signal, channel_availability))
+
+
+@dataclass(frozen=True)
+class SpectralAttentionConfig:
+    """Configuration for the spectral-feature attention risk model."""
+
+    n_features: int = 27
+    n_chunks: int = 540
+    embedding_dim: int = 32
+    hidden_dim: int = 64
+    attention_dim: int = 64
+    temporal_kernel: int = 5
+    dropout: float = 0.3
+    n_chans: int = 3
+
+
+class SpectralAttentionRiskModel(nn.Module):
+    """Encode per-chunk spectral features, then pool them by learned attention.
+
+    Replaces the from-scratch convolutional encoder with the representation the
+    seizure literature already uses -- band power, Hjorth descriptors, line
+    length -- computed once offline. The motivation is sample size: EEGNet had
+    to learn a filter bank from 2,484 training positives and reached chance on
+    held-out patients, while these features cost no parameters at all.
+
+    Three deliberate pieces:
+
+    ``encoder``
+        A small per-chunk MLP. Shared across all 540 chunks.
+    ``temporal``
+        A depthwise convolution along the chunk axis, so the model can see local
+        *dynamics* (a trend across ~25 s) rather than only per-chunk snapshots.
+        Attention over independent embeddings cannot express that on its own.
+    ``attention``
+        Learned pooling with a fixed sinusoidal position encoding. Mean pooling
+        weights each chunk 1/540 and is permutation-invariant; both properties
+        were measured to be fatal for this task.
+    """
+
+    def __init__(self, config: SpectralAttentionConfig) -> None:
+        super().__init__()
+        if config.temporal_kernel % 2 != 1:
+            raise ValueError("temporal_kernel must be odd so padding stays centred.")
+
+        self.config = config
+
+        self.encoder = nn.Sequential(
+            nn.Linear(config.n_features, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.embedding_dim),
+        )
+        self.temporal = nn.Conv1d(
+            config.embedding_dim,
+            config.embedding_dim,
+            kernel_size=config.temporal_kernel,
+            padding=config.temporal_kernel // 2,
+            groups=config.embedding_dim,
+        )
+        self.temporal_norm = nn.LayerNorm(config.embedding_dim)
+
+        self.register_buffer(
+            "position_table",
+            sinusoidal_position_encoding(config.n_chunks, config.embedding_dim),
+            persistent=False,
+        )
+        self.attention = nn.Sequential(
+            nn.Linear(config.embedding_dim, config.attention_dim),
+            nn.Tanh(),
+            nn.Linear(config.attention_dim, 1),
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(config.embedding_dim + config.n_chans),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.embedding_dim + config.n_chans, 1),
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        availability_columns: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Return one seizure-risk logit per 45-minute context."""
+        if features.ndim != 3:
+            raise ValueError(
+                "features must have shape (batch, chunks, n_features); "
+                f"found {tuple(features.shape)}."
+            )
+        batch_size, number_of_chunks, n_features = features.shape
+        if n_features != self.config.n_features:
+            raise ValueError(
+                f"expected {self.config.n_features} features, found {n_features}."
+            )
+
+        embeddings = self.encoder(features)
+
+        residual = embeddings
+        embeddings = self.temporal(embeddings.transpose(1, 2)).transpose(1, 2)
+        embeddings = self.temporal_norm(embeddings + residual)
+
+        if number_of_chunks > self.position_table.shape[0]:
+            raise ValueError(
+                f"model configured for {self.position_table.shape[0]} chunks, "
+                f"received {number_of_chunks}."
+            )
+        embeddings = embeddings + self.position_table[:number_of_chunks].unsqueeze(0)
+
+        attention_weights = torch.softmax(
+            self.attention(embeddings).squeeze(-1), dim=1
+        )
+        pooled = torch.einsum("bm,bmd->bd", attention_weights, embeddings)
+
+        # Collapse the per-column availability back to one flag per electrode.
+        per_channel = availability_columns.shape[1] // self.config.n_chans
+        channel_availability = availability_columns.reshape(
+            batch_size, self.config.n_chans, per_channel
+        )[:, :, 0]
+
+        logits = self.classifier(
+            torch.cat([pooled, channel_availability.to(pooled.dtype)], dim=1)
+        ).squeeze(1)
+        if return_attention:
+            return logits, attention_weights
+        return logits
+
+    def predict_proba(
+        self,
+        features: torch.Tensor,
+        availability_columns: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the model's uncalibrated next-10-minute seizure probability."""
+        return torch.sigmoid(self(features, availability_columns))
