@@ -453,3 +453,87 @@ class SpectralAttentionRiskModel(nn.Module):
     ) -> torch.Tensor:
         """Return the model's uncalibrated next-10-minute seizure probability."""
         return torch.sigmoid(self(features, availability_columns))
+
+
+class SpectralGRURiskModel(nn.Module):
+    """Same per-chunk features, aggregated by a GRU instead of attention.
+
+    A recurrent aggregator is the other obvious way to weight recent chunks
+    above distant ones. Included so the temporal-aggregation axis is explored
+    rather than assumed: attention and recurrence fail differently, and if both
+    match a linear control then the aggregation strategy is not the limitation.
+    """
+
+    def __init__(self, config: SpectralAttentionConfig, bidirectional: bool = False) -> None:
+        super().__init__()
+        self.config = config
+        self.encoder = nn.Sequential(
+            nn.Linear(config.n_features, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.embedding_dim),
+        )
+        self.gru = nn.GRU(
+            config.embedding_dim,
+            config.embedding_dim,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+        directions = 2 if bidirectional else 1
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(config.embedding_dim * directions + config.n_chans),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.embedding_dim * directions + config.n_chans, 1),
+        )
+
+    def forward(self, features: torch.Tensor, availability_columns: torch.Tensor) -> torch.Tensor:
+        batch_size = features.shape[0]
+        embeddings = self.encoder(features)
+        output, _ = self.gru(embeddings)
+        pooled = output[:, -1, :]  # state at the decision instant
+
+        per_channel = availability_columns.shape[1] // self.config.n_chans
+        flags = availability_columns.reshape(
+            batch_size, self.config.n_chans, per_channel
+        )[:, :, 0]
+        return self.classifier(
+            torch.cat([pooled, flags.to(pooled.dtype)], dim=1)
+        ).squeeze(1)
+
+    def predict_proba(self, features: torch.Tensor, availability_columns: torch.Tensor):
+        return torch.sigmoid(self(features, availability_columns))
+
+
+class SpectralMeanPoolRiskModel(nn.Module):
+    """Per-chunk MLP encoder with plain mean pooling — the aggregation ablation."""
+
+    def __init__(self, config: SpectralAttentionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.encoder = nn.Sequential(
+            nn.Linear(config.n_features, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.embedding_dim),
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(config.embedding_dim + config.n_chans),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.embedding_dim + config.n_chans, 1),
+        )
+
+    def forward(self, features: torch.Tensor, availability_columns: torch.Tensor) -> torch.Tensor:
+        batch_size = features.shape[0]
+        pooled = self.encoder(features).mean(dim=1)
+        per_channel = availability_columns.shape[1] // self.config.n_chans
+        flags = availability_columns.reshape(
+            batch_size, self.config.n_chans, per_channel
+        )[:, :, 0]
+        return self.classifier(
+            torch.cat([pooled, flags.to(pooled.dtype)], dim=1)
+        ).squeeze(1)
+
+    def predict_proba(self, features: torch.Tensor, availability_columns: torch.Tensor):
+        return torch.sigmoid(self(features, availability_columns))

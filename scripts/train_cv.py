@@ -49,6 +49,8 @@ from seizure_prediction.datasets import ChunkFeatureDataset  # noqa: E402
 from seizure_prediction.models import (  # noqa: E402
     SpectralAttentionConfig,
     SpectralAttentionRiskModel,
+    SpectralGRURiskModel,
+    SpectralMeanPoolRiskModel,
 )
 
 ALARM_BUDGETS = (0.1, 0.25, 0.5, 1.0, 2.0)
@@ -69,8 +71,28 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
+        "--history-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Use only the last N minutes of the stored 45-minute history. "
+            "Trims the feature window; nothing is rebuilt."
+        ),
+    )
+    parser.add_argument(
+        "--sop-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Relabel with a wider seizure-occurrence period. The stored labels "
+            "use 10 min; a wider window only turns negatives into positives, so "
+            "it needs no new EEG and no new eligibility check."
+        ),
+    )
+    parser.add_argument(
         "--architecture",
-        choices=("spectral-attention", "logistic-mean"),
+        choices=("spectral-attention", "spectral-gru", "spectral-meanpool",
+                 "logistic-mean"),
         default="spectral-attention",
         help=(
             "logistic-mean is a linear control: the same features averaged over "
@@ -159,18 +181,99 @@ def subsample_negatives(
     ).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
+def chunks_used(arguments) -> int:
+    """Chunks per example after any history trimming."""
+    full = int(CONFIG.input_window_seconds / CONFIG.chunk_window_seconds)
+    if arguments.history_minutes is None:
+        return full
+    return int(round(arguments.history_minutes * 60.0 / CONFIG.chunk_window_seconds))
+
+
 def build_model(arguments, n_features: int, device: torch.device) -> nn.Module:
     if arguments.architecture == "logistic-mean":
         return LogisticMeanModel(n_features).to(device)
-    return SpectralAttentionRiskModel(
-        SpectralAttentionConfig(
-            n_features=n_features,
-            n_chunks=int(CONFIG.input_window_seconds / CONFIG.chunk_window_seconds),
-            embedding_dim=arguments.embedding_dim,
-            hidden_dim=arguments.hidden_dim,
-            dropout=arguments.dropout,
-        )
-    ).to(device)
+    model_config = SpectralAttentionConfig(
+        n_features=n_features,
+        n_chunks=chunks_used(arguments),
+        embedding_dim=arguments.embedding_dim,
+        hidden_dim=arguments.hidden_dim,
+        dropout=arguments.dropout,
+    )
+    if arguments.architecture == "spectral-gru":
+        return SpectralGRURiskModel(model_config).to(device)
+    if arguments.architecture == "spectral-meanpool":
+        return SpectralMeanPoolRiskModel(model_config).to(device)
+    return SpectralAttentionRiskModel(model_config).to(device)
+
+
+def relabel_for_sop(decisions: pd.DataFrame, sop_minutes: float) -> pd.DataFrame:
+    """Widen the seizure-occurrence period by relabelling existing decisions.
+
+    The stored labels use SOP = 10 min. Widening it can only turn negatives into
+    positives: a decision's history, its cleanliness and its ictal/postictal
+    exclusion are all independent of how far ahead the label looks. Only
+    seizures already marked eligible may become targets, so the 60-minute
+    clear-history guarantee still holds.
+    """
+    seizures = pd.read_csv(
+        CONFIG.manifests_dir / "seizure_manifest.csv",
+        dtype={"subject": str, "session": str, "task": str, "run": str},
+    )
+    eligible = seizures[
+        seizures["eligible_for_prediction"].astype(str).str.lower().eq("true")
+    ]
+    onsets: dict[str, np.ndarray] = {}
+    ids: dict[str, np.ndarray] = {}
+    for _, row in eligible.iterrows():
+        parts = [f"sub-{row['subject']}"]
+        if isinstance(row["session"], str) and row["session"]:
+            parts.append(f"ses-{row['session']}")
+        if isinstance(row["task"], str) and row["task"]:
+            parts.append(f"task-{row['task']}")
+        if isinstance(row["run"], str) and row["run"]:
+            parts.append(f"run-{row['run']}")
+        key = "_".join(parts)
+        onsets.setdefault(key, []).append(float(row["onset_seconds"]))
+        ids.setdefault(key, []).append(str(row["seizure_id"]))
+
+    window = sop_minutes * 60.0
+    updated = decisions.copy()
+    label = updated["label"].to_numpy(dtype=np.int64).copy()
+    target = updated["target_seizure_id"].astype("object").to_numpy().copy()
+    times = updated["decision_time_seconds"].to_numpy(dtype=np.float64)
+    recordings = updated["recording_id"].astype(str).to_numpy()
+
+    changed = 0
+    for key in np.unique(recordings):
+        if key not in onsets:
+            continue
+        mask = recordings == key
+        recording_onsets = np.asarray(onsets[key], dtype=np.float64)
+        recording_ids = np.asarray(ids[key], dtype=object)
+        t = times[mask]
+        # nearest future onset within the widened window
+        delta = recording_onsets[None, :] - t[:, None]
+        inside = (delta > 0) & (delta <= window)
+        any_inside = inside.any(axis=1)
+        first = np.where(any_inside, np.argmax(inside, axis=1), 0)
+
+        block_label = label[mask]
+        block_target = target[mask]
+        promote = any_inside & (block_label == 0)
+        changed += int(promote.sum())
+        block_label[promote] = 1
+        block_target[promote] = recording_ids[first[promote]]
+        label[mask] = block_label
+        target[mask] = block_target
+
+    updated["label"] = label
+    updated["target_seizure_id"] = target
+    print(
+        f"SOP {sop_minutes:g} min: promoted {changed:,} negatives to positive "
+        f"({int((decisions['label']==1).sum()):,} -> {int(label.sum()):,})",
+        flush=True,
+    )
+    return updated
 
 
 @torch.no_grad()
@@ -193,13 +296,15 @@ def train_one_fold(
 ) -> nn.Module:
     """Train on a fold's patients, selecting the epoch on an inner patient split."""
     train_loader = DataLoader(
-        ChunkFeatureDataset(train_examples, CONFIG, arguments.feature_dir),
+        ChunkFeatureDataset(train_examples, CONFIG, arguments.feature_dir,
+                            history_minutes=arguments.history_minutes),
         batch_size=arguments.batch_size, shuffle=True,
         num_workers=arguments.num_workers, pin_memory=device.type == "cuda",
         persistent_workers=arguments.num_workers > 0, drop_last=False,
     )
     inner_loader = DataLoader(
-        ChunkFeatureDataset(inner_examples, CONFIG, arguments.feature_dir),
+        ChunkFeatureDataset(inner_examples, CONFIG, arguments.feature_dir,
+                            history_minutes=arguments.history_minutes),
         batch_size=256, shuffle=False, num_workers=arguments.num_workers,
         persistent_workers=arguments.num_workers > 0,
     )
@@ -292,6 +397,44 @@ def bootstrap_seizure_sensitivity(
     )
 
 
+def vigilance_breakdown(frame: pd.DataFrame, budget: float) -> list[dict]:
+    """Seizure-level sensitivity split by the patient's state at onset.
+
+    42% of annotated seizures occur asleep. Sleep and wake EEG differ profoundly,
+    so a single model spanning both may be averaging over two different problems.
+    This is reported rather than trained on, so it costs nothing.
+    """
+    seizures = pd.read_csv(
+        CONFIG.manifests_dir / "seizure_manifest.csv", dtype={"subject": str}
+    )
+    state = dict(
+        zip(seizures["seizure_id"].astype(str), seizures["vigilance"].astype(str))
+    )
+    threshold = threshold_for_budget(frame, budget)
+    positives = frame[frame["label"] == 1].copy()
+    if positives.empty:
+        return []
+    caught = (
+        positives.assign(alarm=positives["probability"] >= threshold)
+        .groupby("target_seizure_id")["alarm"].any()
+    )
+    rows = []
+    labels = pd.Series(
+        {s: state.get(str(s), "un") for s in caught.index}, dtype="object"
+    )
+    for value in sorted(set(labels.values)):
+        selected = caught[labels == value]
+        if len(selected) == 0:
+            continue
+        rows.append({
+            "vigilance": value,
+            "seizures": int(len(selected)),
+            "detected": int(selected.sum()),
+            "sensitivity": float(selected.mean()),
+        })
+    return rows
+
+
 def main() -> None:
     arguments = parse_arguments()
     CONFIG.validate()
@@ -305,6 +448,8 @@ def main() -> None:
     log(f"Device: {device} | architecture: {arguments.architecture}")
     log("Loading decisions (train + validation patients; test excluded)...")
     decisions = load_all_decisions(arguments.feature_dir)
+    if arguments.sop_minutes is not None:
+        decisions = relabel_for_sop(decisions, arguments.sop_minutes)
     patients = np.array(sorted(decisions["subject"].unique()))
     log(f"  {len(decisions):,} decisions | {len(patients)} patients | "
         f"{int((decisions['label']==1).sum()):,} positive")
@@ -355,7 +500,8 @@ def main() -> None:
         )
 
         loader = DataLoader(
-            ChunkFeatureDataset(test_examples, CONFIG, arguments.feature_dir),
+            ChunkFeatureDataset(test_examples, CONFIG, arguments.feature_dir,
+                                history_minutes=arguments.history_minutes),
             batch_size=256, shuffle=False, num_workers=arguments.num_workers,
             persistent_workers=arguments.num_workers > 0,
         )
@@ -418,6 +564,15 @@ def main() -> None:
         "brier_score": float(brier_score_loss(labels, scores)),
         "per_fold": fold_rows,
         "alarm_budgets": budgets,
+        "vigilance_at_1_per_hour": vigilance_breakdown(pooled, 1.0),
+        "history_minutes": arguments.history_minutes
+        or CONFIG.input_window_seconds / 60.0,
+        "sop_minutes": arguments.sop_minutes
+        or CONFIG.seizure_occurrence_period_minutes,
+        "chunks_used": chunks_used(arguments),
+        "model_parameters": int(
+            sum(p.numel() for p in build_model(arguments, n_features, "cpu").parameters())
+        ),
         "arguments": {k: (str(v) if isinstance(v, Path) else v)
                       for k, v in vars(arguments).items()},
         "note": "test patients (113-125) were not used",
@@ -442,6 +597,13 @@ def main() -> None:
               f"{b['seizure_sensitivity']:.3f}  "
               f"[{b['ci_low']:.3f}, {b['ci_high']:.3f}]   "
               f"{b['seizures_detected']}/{b['seizures_total']}")
+    print()
+    if summary["vigilance_at_1_per_hour"]:
+        print()
+        print("By vigilance at onset (<= 1 alarm/h):")
+        for row in summary["vigilance_at_1_per_hour"]:
+            print(f"  {row['vigilance']:8s} {row['detected']:3d}/{row['seizures']:<4d} "
+                  f"= {row['sensitivity']:.3f}")
     print()
     print(f"Elapsed: {(time.perf_counter()-started)/60:.1f} min")
     print(f"Artefacts: {output}")

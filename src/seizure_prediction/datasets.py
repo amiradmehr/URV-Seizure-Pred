@@ -336,11 +336,17 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         config: PreprocessingConfig,
         feature_dir: Path,
         normalize: bool = True,
+        history_minutes: float | None = None,
     ) -> None:
         self.examples = examples.reset_index(drop=True)
         self.config = config
         self.feature_dir = Path(feature_dir)
         self.normalize = normalize
+        # A shorter history keeps the chunks *closest to the decision*. The
+        # stored window always spans the configured 45 minutes; trimming here
+        # costs nothing and lets the effective context be swept without
+        # rebuilding anything.
+        self.history_minutes = history_minutes
         self._cache: dict[str, np.ndarray] = {}
         self._availability_cache: dict[str, np.ndarray] = {}
 
@@ -350,6 +356,17 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         self.n_chunks = int(
             round(config.input_window_seconds / config.chunk_window_seconds)
         )
+        if history_minutes is None:
+            self.n_chunks_used = self.n_chunks
+        else:
+            self.n_chunks_used = int(
+                round(history_minutes * 60.0 / config.chunk_window_seconds)
+            )
+            if not 1 <= self.n_chunks_used <= self.n_chunks:
+                raise ValueError(
+                    f"history_minutes={history_minutes} maps to "
+                    f"{self.n_chunks_used} chunks, outside 1..{self.n_chunks}."
+                )
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -394,6 +411,9 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
                 )
         else:
             window = np.asarray(bank[start:stop], dtype=np.float32)
+
+        if self.n_chunks_used != self.n_chunks:
+            window = window[-self.n_chunks_used :]
 
         if self.normalize:
             window = normalize_window(window, availability_columns)
