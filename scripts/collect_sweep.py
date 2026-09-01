@@ -1,12 +1,12 @@
-r"""Collect every cross-validation result into one table and one comparison chart.
+r"""Assemble every finished cross-validation run into one comparable table.
 
-Reads outputs/cv/*/cv_metrics.json and writes, into outputs/sweep/:
+Reads each outputs/cv/<tag>/cv_metrics.json and writes:
 
-    sweep_results.csv     one row per configuration, sorted by the headline metric
-    sweep_comparison.png  the grid as charts
-    sweep_summary.json    the best rows plus the chance reference
+    outputs/sweep/results.csv          one row per configuration
+    outputs/sweep/results.md           the same, ranked, as a table
+    outputs/sweep/sweep_overview.png   effect of each axis
 
-    python scripts/collect_sweep.py
+Safe to run while the sweep is still going; it reports whatever has landed.
 """
 
 from __future__ import annotations
@@ -25,12 +25,16 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIRECTORY = PROJECT_ROOT / "src"
-if str(SRC_DIRECTORY) not in sys.path:
-    sys.path.insert(0, str(SRC_DIRECTORY))
-
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
 INK = "#52514e"
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cv-dir", type=Path, default=PROJECT_ROOT / "outputs" / "cv")
+    parser.add_argument("--output-dir", type=Path,
+                        default=PROJECT_ROOT / "outputs" / "sweep")
+    return parser.parse_args()
 
 
 def style(axis: plt.Axes) -> None:
@@ -43,137 +47,124 @@ def style(axis: plt.Axes) -> None:
         axis.spines[side].set_linewidth(0.8)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cv-dir", type=Path, default=PROJECT_ROOT / "outputs" / "cv")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "sweep")
-    arguments = parser.parse_args()
-    arguments.output_dir.mkdir(parents=True, exist_ok=True)
-
+def collect(cv_dir: Path) -> pd.DataFrame:
     rows = []
-    for path in sorted(arguments.cv_dir.glob("*/cv_metrics.json")):
-        m = json.loads(path.read_text(encoding="utf-8"))
-        budgets = {b["false_alarm_budget_per_hour"]: b for b in m.get("alarm_budgets", [])}
+    for path in sorted(cv_dir.glob("*/cv_metrics.json")):
+        try:
+            metrics = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        budgets = {
+            b["false_alarm_budget_per_hour"]: b for b in metrics.get("alarm_budgets", [])
+        }
         one = budgets.get(1.0, {})
         row = {
-            "tag": m.get("tag"),
-            "architecture": m.get("architecture"),
-            "parameters": m.get("model_parameters"),
-            "history_minutes": m.get("history_minutes"),
-            "sop_minutes": m.get("sop_minutes"),
-            "chunks_used": m.get("chunks_used"),
-            "patients": m.get("patients"),
-            "seizures": m.get("target_seizures"),
-            "decisions": m.get("decisions"),
-            "prevalence": m.get("prevalence"),
-            "average_precision": m.get("average_precision"),
-            "ap_over_chance": m.get("ap_over_chance"),
-            "roc_auc": m.get("roc_auc"),
-            "brier_score": m.get("brier_score"),
-            "sz_sens_at_1ph": one.get("seizure_sensitivity"),
-            "sz_ci_low": one.get("ci_low"),
-            "sz_ci_high": one.get("ci_high"),
-            "sz_detected": one.get("seizures_detected"),
-            "sz_total": one.get("seizures_total"),
+            "tag": metrics.get("tag", path.parent.name),
+            "architecture": metrics.get("architecture"),
+            "parameters": metrics.get("model_parameters"),
+            "history_min": metrics.get("history_minutes"),
+            "sop_min": metrics.get("sop_minutes"),
+            "chunks": metrics.get("chunks_used"),
+            "seizures": metrics.get("target_seizures"),
+            "decisions": metrics.get("decisions"),
+            "prevalence": metrics.get("prevalence"),
+            "ap": metrics.get("average_precision"),
+            "ap_over_chance": metrics.get("ap_over_chance"),
+            "auc": metrics.get("roc_auc"),
+            "brier": metrics.get("brier_score"),
+            "sens_at_1ph": one.get("seizure_sensitivity"),
+            "sens_ci_low": one.get("ci_low"),
+            "sens_ci_high": one.get("ci_high"),
+            "detected_at_1ph": one.get("seizures_detected"),
         }
-        for entry in m.get("vigilance_at_1_per_hour", []):
+        folds = metrics.get("per_fold", [])
+        if folds:
+            row["auc_fold_std"] = float(np.std([f["roc_auc"] for f in folds]))
+        for entry in metrics.get("vigilance_at_1_per_hour", []):
             row[f"sens_{entry['vigilance']}"] = entry["sensitivity"]
             row[f"n_{entry['vigilance']}"] = entry["seizures"]
         rows.append(row)
-
     if not rows:
-        raise SystemExit(f"No cv_metrics.json found under {arguments.cv_dir}")
+        raise SystemExit(f"No finished runs found under {cv_dir}")
+    return pd.DataFrame(rows).sort_values("ap_over_chance", ascending=False)
 
-    frame = pd.DataFrame(rows).sort_values("ap_over_chance", ascending=False)
-    frame.to_csv(arguments.output_dir / "sweep_results.csv", index=False)
-    print(f"{len(frame)} configurations collected")
 
-    complete = frame.dropna(subset=["ap_over_chance", "roc_auc"])
+def plot_overview(results: pd.DataFrame, path: Path) -> None:
+    figure, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-    figure, axes = plt.subplots(2, 2, figsize=(15, 9))
-
-    # 1. AP over chance, ranked
     axis = axes[0, 0]
-    ordered = complete.sort_values("ap_over_chance")
-    colors = [ORANGE if v > 1.0 else BLUE for v in ordered["ap_over_chance"]]
-    axis.barh(np.arange(len(ordered)), ordered["ap_over_chance"], color=colors, height=0.7)
-    axis.axvline(1.0, color=INK, linestyle="--", linewidth=1.5)
-    axis.annotate("chance", xy=(1.0, 0.02), xycoords=("data", "axes fraction"),
-                  xytext=(4, 0), textcoords="offset points", fontsize=9, color=INK)
-    axis.set(title="Average precision relative to chance",
-             xlabel="AP / prevalence  (1.0 = chance)",
-             yticks=np.arange(len(ordered)),
-             yticklabels=[t[:38] for t in ordered["tag"]])
-    axis.tick_params(axis="y", labelsize=6.5)
+    axis.axhline(1.0, color=ORANGE, linestyle="--", linewidth=1.5)
+    axis.annotate("chance", xy=(0.02, 1.0), xycoords=("axes fraction", "data"),
+                  xytext=(0, 4), textcoords="offset points", fontsize=9, color=ORANGE)
+    axis.scatter(results["parameters"], results["ap_over_chance"],
+                 s=34, color=BLUE, alpha=0.85)
+    axis.set(title="Capacity buys nothing if the ratio stays at 1",
+             xlabel="Model parameters (count)",
+             ylabel="AP / chance (dimensionless)", xscale="log")
     style(axis)
 
-    # 2. AUC by architecture
-    axis = axes[0, 1]
-    architectures = sorted(complete["architecture"].unique())
-    for index, architecture in enumerate(architectures):
-        values = complete.loc[complete["architecture"] == architecture, "roc_auc"]
-        axis.scatter(np.full(len(values), index) + np.random.uniform(-.12, .12, len(values)),
-                     values, s=34, color=[BLUE, ORANGE, AQUA, INK][index % 4], alpha=0.85)
-    axis.axhline(0.5, color=INK, linestyle="--", linewidth=1.5)
-    axis.set(title="ROC AUC by aggregation strategy", ylabel="ROC AUC (pooled out-of-fold)",
-             xticks=np.arange(len(architectures)),
-             xticklabels=[a.replace("spectral-", "") for a in architectures])
-    style(axis)
+    for index, (column, label) in enumerate(
+        (("history_min", "History length (min)"), ("sop_min", "SOP (min)"))
+    ):
+        axis = axes[0, 1] if index == 0 else axes[1, 0]
+        groups = results.groupby(column)["ap_over_chance"]
+        positions = np.arange(len(groups))
+        axis.bar(positions, groups.mean(), yerr=groups.std().fillna(0.0),
+                 color=BLUE, width=0.55, capsize=4)
+        axis.axhline(1.0, color=ORANGE, linestyle="--", linewidth=1.5)
+        axis.set(title=f"Effect of {label.lower()}", xlabel=label,
+                 ylabel="AP / chance (mean, sd over configs)",
+                 xticks=positions,
+                 xticklabels=[f"{v:g}" for v in groups.groups])
+        style(axis)
 
-    # 3. effect of history length and SOP
-    axis = axes[1, 0]
-    for sop, color, marker in ((10.0, BLUE, "o"), (30.0, ORANGE, "s")):
-        subset = complete[complete["sop_minutes"] == sop]
-        grouped = subset.groupby("history_minutes")["roc_auc"]
-        if len(grouped) == 0:
-            continue
-        axis.errorbar(grouped.mean().index, grouped.mean().values,
-                      yerr=grouped.std().fillna(0).values, color=color, marker=marker,
-                      markersize=8, linewidth=2, capsize=4, label=f"SOP {sop:g} min")
-    axis.axhline(0.5, color=INK, linestyle="--", linewidth=1.5)
-    axis.set(title="Context length and prediction window",
-             xlabel="History used (min)", ylabel="ROC AUC (mean ± sd across configs)")
-    axis.legend(frameon=False, fontsize=9)
-    style(axis)
-
-    # 4. capacity
     axis = axes[1, 1]
-    axis.scatter(complete["parameters"], complete["roc_auc"], s=40, color=BLUE, alpha=0.8)
-    axis.axhline(0.5, color=INK, linestyle="--", linewidth=1.5)
-    axis.set(title="Model capacity", xlabel="Trainable parameters (count)",
-             ylabel="ROC AUC", xscale="log")
+    order = results.groupby("architecture")["ap_over_chance"].mean().sort_values()
+    axis.barh(np.arange(len(order)), order.values, color=AQUA, height=0.6)
+    axis.axvline(1.0, color=ORANGE, linestyle="--", linewidth=1.5)
+    axis.set(title="Effect of aggregation", xlabel="AP / chance (mean over configs)",
+             yticks=np.arange(len(order)), yticklabels=list(order.index))
     style(axis)
 
     figure.suptitle(
-        f"Exploration sweep — {len(complete)} configurations, "
-        f"patient-wise 5-fold CV, {int(complete['seizures'].max())} seizures",
+        f"Exploration sweep — {len(results)} configurations, "
+        f"patient-wise 5-fold CV on {int(results['seizures'].max())} seizures",
         fontsize=14,
     )
     figure.tight_layout()
-    figure.savefig(arguments.output_dir / "sweep_comparison.png", dpi=140,
-                   bbox_inches="tight", facecolor="white")
+    figure.savefig(path, dpi=140, bbox_inches="tight", facecolor="white")
     plt.close(figure)
 
-    best = frame.iloc[0]
-    summary = {
-        "configurations": int(len(frame)),
-        "best_by_ap_over_chance": {
-            k: (None if pd.isna(v) else v)
-            for k, v in best.to_dict().items()
-        },
-        "any_above_chance_ap": bool((frame["ap_over_chance"] > 1.0).any()),
-        "max_roc_auc": float(frame["roc_auc"].max()),
-        "max_seizure_sensitivity_at_1ph": float(frame["sz_sens_at_1ph"].max()),
-        "note": "test patients (113-125) excluded from every configuration",
-    }
-    (arguments.output_dir / "sweep_summary.json").write_text(
-        json.dumps(summary, indent=2, default=float), encoding="utf-8"
+
+def main() -> None:
+    arguments = parse_arguments()
+    output = arguments.output_dir
+    output.mkdir(parents=True, exist_ok=True)
+
+    results = collect(arguments.cv_dir)
+    results.to_csv(output / "results.csv", index=False)
+
+    columns = ["tag", "architecture", "parameters", "history_min", "sop_min",
+               "seizures", "prevalence", "ap", "ap_over_chance", "auc", "brier",
+               "sens_at_1ph", "sens_ci_low", "sens_ci_high"]
+    table = results[[c for c in columns if c in results.columns]]
+    (output / "results.md").write_text(
+        f"# Exploration sweep — {len(results)} configurations\n\n"
+        "Patient-wise 5-fold cross-validation, test patients excluded.\n"
+        "Ranked by average precision relative to chance.\n\n"
+        + table.to_markdown(index=False, floatfmt=".4f"),
+        encoding="utf-8",
     )
 
-    show = ["tag", "parameters", "history_minutes", "sop_minutes",
-            "ap_over_chance", "roc_auc", "sz_sens_at_1ph"]
-    print(frame[show].head(12).to_string(index=False))
-    print(f"\nWrote {arguments.output_dir}")
+    plot_overview(results, output / "sweep_overview.png")
+
+    print(f"{len(results)} runs collected")
+    print(table.head(12).to_string(index=False))
+    print(f"\nBest AP/chance : {results['ap_over_chance'].max():.3f}")
+    print(f"Best AUC       : {results['auc'].max():.4f}")
+    print(f"Runs above chance (AP ratio > 1.0): "
+          f"{int((results['ap_over_chance'] > 1.0).sum())}/{len(results)}")
+    print(f"\nArtefacts: {output}")
 
 
 if __name__ == "__main__":
