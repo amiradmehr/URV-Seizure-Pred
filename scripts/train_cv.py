@@ -109,6 +109,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "cv"
     )
+    parser.add_argument(
+        "--decisions-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Use an externally generated decision set (see "
+            "scripts/build_relaxed_decisions.py) instead of the pipeline's "
+            "decision manifest. Lets eligibility be varied -- the one axis the "
+            "42-config sweep could not reach."
+        ),
+    )
     parser.add_argument("--bootstrap", type=int, default=2000)
     return parser.parse_args()
 
@@ -446,8 +457,16 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
 
     log(f"Device: {device} | architecture: {arguments.architecture}")
-    log("Loading decisions (train + validation patients; test excluded)...")
-    decisions = load_all_decisions(arguments.feature_dir)
+    if arguments.decisions_csv is not None:
+        log(f"Loading external decision set {arguments.decisions_csv}")
+        decisions = pd.read_csv(
+            arguments.decisions_csv,
+            dtype={"recording_id": str, "subject": str, "target_seizure_id": str},
+        )
+        decisions["target_seizure_id"] = decisions["target_seizure_id"].fillna("")
+    else:
+        log("Loading decisions (train + validation patients; test excluded)...")
+        decisions = load_all_decisions(arguments.feature_dir)
     if arguments.sop_minutes is not None:
         decisions = relabel_for_sop(decisions, arguments.sop_minutes)
     patients = np.array(sorted(decisions["subject"].unique()))

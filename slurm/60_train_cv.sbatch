@@ -2,7 +2,7 @@
 #SBATCH --job-name=sz2-cv
 #SBATCH --partition=gpu,gpu-preempt
 #SBATCH --gpus=1
-#SBATCH --constraint=sm_70
+#SBATCH --constraint=sm_75
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=3
 #SBATCH --mem=24G

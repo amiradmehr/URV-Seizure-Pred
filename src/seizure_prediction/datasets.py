@@ -394,26 +394,28 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         row = self.examples.iloc[index]
         bank, availability_columns = self._bank(str(row["recording_id"]))
 
-        # Chunk grid is aligned to the recording start, so the history's first
-        # chunk index follows directly from its first sample.
-        start = int(row["history_start_sample"]) // self.chunk_samples
-        stop = start + self.n_chunks
-        if stop > bank.shape[0]:
+        # Anchor on the decision instant, not on history_start_sample. The chunk
+        # grid is aligned to the recording start, so the decision's chunk index
+        # follows directly from its end sample. Anchoring this way makes the
+        # window correct for decision sets built with a history shorter than the
+        # configured 45 min; for the standard 45-min decisions it is identical,
+        # since history_start_sample == decision_end_sample - 540*chunk_samples.
+        stop = int(row["decision_end_sample"]) // self.chunk_samples
+        start = stop - self.n_chunks_used
+        if start < 0 or stop > bank.shape[0]:
             # A recording whose trailing partial chunk was dropped can fall one
             # short; pad by repeating the last chunk rather than failing.
-            window = np.asarray(bank[start:], dtype=np.float32)
+            window = np.asarray(bank[max(start, 0) : min(stop, bank.shape[0])],
+                                dtype=np.float32)
             if window.shape[0] == 0:
-                window = np.zeros((self.n_chunks, bank.shape[1]), dtype=np.float32)
-            else:
-                pad = self.n_chunks - window.shape[0]
+                window = np.zeros((self.n_chunks_used, bank.shape[1]), dtype=np.float32)
+            elif window.shape[0] < self.n_chunks_used:
+                pad = self.n_chunks_used - window.shape[0]
                 window = np.concatenate(
-                    [window, np.repeat(window[-1:], pad, axis=0)], axis=0
+                    [np.repeat(window[:1], pad, axis=0), window], axis=0
                 )
         else:
             window = np.asarray(bank[start:stop], dtype=np.float32)
-
-        if self.n_chunks_used != self.n_chunks:
-            window = window[-self.n_chunks_used :]
 
         if self.normalize:
             window = normalize_window(window, availability_columns)
