@@ -537,3 +537,71 @@ class SpectralMeanPoolRiskModel(nn.Module):
 
     def predict_proba(self, features: torch.Tensor, availability_columns: torch.Tensor):
         return torch.sigmoid(self(features, availability_columns))
+
+
+class SpectralContrastRiskModel(nn.Module):
+    """Recency contrast pooling: recent chunks, and how they differ from the rest.
+
+    Mean pooling over all 540 chunks dilutes any temporally localised marker by
+    roughly the ratio of window to marker. Measured on a positive control where
+    the signal is known to be present -- 45-minute windows containing 5 minutes
+    of frank ictal EEG -- pooling operators separate ictal from interictal at:
+
+        mean over 540 chunks              AUC 0.561
+        max over 540                      AUC 0.536
+        mean of the last 60 chunks        AUC 0.799
+        [last-60 mean, last-60 - rest]    AUC 0.817
+
+    So the aggregation, not the feature set, was the capacity bottleneck for
+    anything time-localised. This module implements the last operator: the
+    recent-window mean concatenated with its contrast against the earlier part
+    of the same window, which is both recency-weighted and self-referencing.
+
+    Note this fix recovers the ICTAL signal and, on the same machinery, recovers
+    nothing pre-ictal (AUC 0.46-0.52). It is included because a known defect
+    should be fixed regardless of whether it rescues the headline result.
+    """
+
+    def __init__(
+        self,
+        config: SpectralAttentionConfig,
+        recent_chunks: int = 60,
+    ) -> None:
+        super().__init__()
+        if recent_chunks < 1:
+            raise ValueError("recent_chunks must be positive.")
+        self.config = config
+        self.recent_chunks = recent_chunks
+        self.encoder = nn.Sequential(
+            nn.Linear(config.n_features * 2, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.embedding_dim),
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(config.embedding_dim + config.n_chans),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.embedding_dim + config.n_chans, 1),
+        )
+
+    def forward(self, features: torch.Tensor, availability_columns: torch.Tensor) -> torch.Tensor:
+        batch_size, n_chunks, _ = features.shape
+        k = min(self.recent_chunks, n_chunks)
+        recent = features[:, -k:, :].mean(dim=1)
+        if n_chunks > k:
+            rest = features[:, :-k, :].mean(dim=1)
+        else:
+            rest = torch.zeros_like(recent)
+        pooled = self.encoder(torch.cat([recent, recent - rest], dim=1))
+
+        per_channel = availability_columns.shape[1] // self.config.n_chans
+        flags = availability_columns.reshape(
+            batch_size, self.config.n_chans, per_channel
+        )[:, :, 0]
+        return self.classifier(
+            torch.cat([pooled, flags.to(pooled.dtype)], dim=1)
+        ).squeeze(1)
+
+    def predict_proba(self, features: torch.Tensor, availability_columns: torch.Tensor):
+        return torch.sigmoid(self(features, availability_columns))

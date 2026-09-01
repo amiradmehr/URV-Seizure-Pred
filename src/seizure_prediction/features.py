@@ -151,25 +151,98 @@ def chunk_features(
     return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# A present channel whose log total power sits at or near the log(1e-12) floor
+# of -27.59 is a dead electrode, not EEG. The normal 1st-99th percentile range
+# of log_total_power is -6.04 to +3.86, so -20 separates the two cleanly.
+DEAD_CHANNEL_LOG_POWER = -20.0
+
+# normalize_window divides by an IQR floored at ABSOLUTE_IQR_FLOOR. On a window
+# where a present channel is flat, that produced values up to 3.0e7 (0.27% of
+# real decision windows). Clipping the standardised output bounds the damage
+# regardless of how degenerate the input is; +-20 robust IQRs is far outside any
+# legitimate value (measured p99 of max|value| = 90.5 before clipping, but the
+# legitimate median max was 14.5).
+ABSOLUTE_IQR_FLOOR = 1e-3
+OUTPUT_CLIP = 20.0
+
+
+def dead_channel_columns(
+    window: np.ndarray,
+    availability_columns: np.ndarray,
+    channel_count: int = 3,
+) -> np.ndarray:
+    """Return a per-column mask marking channels that are dead in this window.
+
+    A dead electrode emits exact zeros, which is finite and unannotated, so it
+    passes every cleanliness check in the pipeline: the non-finite test, the
+    ``bad*`` annotation test, and the event-overlap tests. Measured consequence:
+    0.28% of NEGATIVE decision windows contain a >=99% dead present channel
+    versus 0.00% of positive windows, i.e. a small spurious cue pointing at
+    "dead electrode implies no seizure".
+    """
+    per_channel = window.shape[1] // channel_count
+    dead = np.zeros(window.shape[1], dtype=bool)
+    for channel in range(channel_count):
+        lo = channel * per_channel
+        hi = lo + per_channel
+        if not availability_columns[lo]:
+            continue
+        # log_total_power is the 6th feature of each channel block.
+        total_power = window[:, lo + len(BANDS)]
+        if np.median(total_power) < DEAD_CHANNEL_LOG_POWER:
+            dead[lo:hi] = True
+    return dead
+
+
 def normalize_window(
     window: np.ndarray,
     availability_columns: np.ndarray,
+    recording_median: np.ndarray | None = None,
 ) -> np.ndarray:
     """Centre and scale a feature window on its own robust statistics.
 
-    ``window`` is ``(n_chunks, n_features)``. Centring in log-power space is what
-    removes the per-patient amplitude gain (see the module docstring); the IQR
-    scaling additionally puts every feature on a comparable range so the model
-    does not have to learn one.
+    Centring in log-power space is what removes the per-patient amplitude gain
+    (see the module docstring); the IQR scaling puts every feature on a
+    comparable range.
 
-    Columns belonging to absent channels are left at exactly zero.
+    Three corrections over the naive version, each from a measured defect:
+
+    * The IQR floor is raised from 1e-6 to 1e-3 and the output is clipped. The
+      old floor let a flat present channel produce values up to 3.0e7; with a
+      batch of 64 and gradient clipping at 5.0, a single such sample dominated
+      the direction of roughly one clipped gradient in four.
+    * Channels that are dead in this window are zeroed, so a dead electrode
+      cannot act as a label cue.
+    * When ``recording_median`` is supplied, the window's own level relative to
+      that baseline is returned alongside the standardised window. Median
+      centring removes the level, and the level is where vigilance lives --
+      measured, window normalisation costs 63% of the asleep-vs-awake
+      discrimination (AUC 0.765 -> 0.599). Referencing to the recording rather
+      than to a global constant keeps the state while still removing the
+      per-patient gain.
     """
     if window.size == 0:
         return window
 
     quartiles = np.percentile(window, [25, 50, 75], axis=0)
     median = quartiles[1]
-    spread = np.maximum(quartiles[2] - quartiles[0], 1e-6)
+    spread = np.maximum(quartiles[2] - quartiles[0], ABSOLUTE_IQR_FLOOR)
     normalized = (window - median) / spread
-    normalized[:, ~availability_columns] = 0.0
-    return normalized.astype(np.float32, copy=False)
+    np.clip(normalized, -OUTPUT_CLIP, OUTPUT_CLIP, out=normalized)
+
+    present = np.asarray(availability_columns, dtype=bool)
+    dead = dead_channel_columns(window, present)
+    normalized[:, ~present] = 0.0
+    normalized[:, dead] = 0.0
+
+    if recording_median is None:
+        return normalized.astype(np.float32, copy=False)
+
+    # Level relative to this recording's own baseline: patient gain cancels,
+    # within-patient state (sleep/wake, drowsiness) survives.
+    level = (median - recording_median)
+    level[~present] = 0.0
+    level[dead] = 0.0
+    level = np.clip(level, -OUTPUT_CLIP, OUTPUT_CLIP)
+    broadcast = np.repeat(level[None, :], normalized.shape[0], axis=0)
+    return np.concatenate([normalized, broadcast], axis=1).astype(np.float32, copy=False)

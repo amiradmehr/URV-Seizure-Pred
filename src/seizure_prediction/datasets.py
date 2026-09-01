@@ -225,6 +225,7 @@ class StreamingDecisionDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         state = self.__dict__.copy()
         state["_signal_cache"] = {}
         state["_availability_cache"] = {}
+        state["_median_cache"] = {}
         return state
 
     def _load_signal(self, signal_path: str) -> np.ndarray:
@@ -337,11 +338,19 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         feature_dir: Path,
         normalize: bool = True,
         history_minutes: float | None = None,
+        level_features: bool = False,
     ) -> None:
         self.examples = examples.reset_index(drop=True)
         self.config = config
         self.feature_dir = Path(feature_dir)
         self.normalize = normalize
+        # Median centring removes the per-patient gain and the window level in
+        # the same operation, and vigilance lives in the level (measured: window
+        # normalisation costs 63% of asleep-vs-awake discrimination). Referencing
+        # the level to the RECORDING's own median keeps the state while still
+        # cancelling the patient gain.
+        self.level_features = level_features
+        self._median_cache: dict[str, np.ndarray] = {}
         # A shorter history keeps the chunks *closest to the decision*. The
         # stored window always spans the configured 45 minutes; trimming here
         # costs nothing and lets the effective context be swept without
@@ -375,6 +384,7 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         state = self.__dict__.copy()
         state["_cache"] = {}
         state["_availability_cache"] = {}
+        state["_median_cache"] = {}
         return state
 
     def _bank(self, recording_id: str) -> tuple[np.ndarray, np.ndarray]:
@@ -418,7 +428,15 @@ class ChunkFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
             window = np.asarray(bank[start:stop], dtype=np.float32)
 
         if self.normalize:
-            window = normalize_window(window, availability_columns)
+            recording_median = None
+            if self.level_features:
+                recording_id = str(row["recording_id"])
+                if recording_id not in self._median_cache:
+                    self._median_cache[recording_id] = np.median(
+                        np.asarray(bank, dtype=np.float32), axis=0
+                    )
+                recording_median = self._median_cache[recording_id]
+            window = normalize_window(window, availability_columns, recording_median)
 
         return (
             torch.from_numpy(np.ascontiguousarray(window)),

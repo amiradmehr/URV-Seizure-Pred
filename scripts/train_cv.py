@@ -49,6 +49,7 @@ from seizure_prediction.datasets import ChunkFeatureDataset  # noqa: E402
 from seizure_prediction.models import (  # noqa: E402
     SpectralAttentionConfig,
     SpectralAttentionRiskModel,
+    SpectralContrastRiskModel,
     SpectralGRURiskModel,
     SpectralMeanPoolRiskModel,
 )
@@ -92,7 +93,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--architecture",
         choices=("spectral-attention", "spectral-gru", "spectral-meanpool",
-                 "logistic-mean"),
+                 "spectral-contrast", "logistic-mean"),
         default="spectral-attention",
         help=(
             "logistic-mean is a linear control: the same features averaged over "
@@ -118,6 +119,18 @@ def parse_arguments() -> argparse.Namespace:
             "scripts/build_relaxed_decisions.py) instead of the pipeline's "
             "decision manifest. Lets eligibility be varied -- the one axis the "
             "42-config sweep could not reach."
+        ),
+    )
+    parser.add_argument(
+        "--recent-chunks", type=int, default=60,
+        help="Chunks treated as 'recent' by spectral-contrast (60 = last 5 min).",
+    )
+    parser.add_argument(
+        "--level-features", action="store_true",
+        help=(
+            "Append each window's level relative to its recording median. "
+            "Window normalisation removes the level along with the patient gain, "
+            "and the level is where vigilance lives."
         ),
     )
     parser.add_argument("--bootstrap", type=int, default=2000)
@@ -210,6 +223,10 @@ def build_model(arguments, n_features: int, device: torch.device) -> nn.Module:
         hidden_dim=arguments.hidden_dim,
         dropout=arguments.dropout,
     )
+    if arguments.architecture == "spectral-contrast":
+        return SpectralContrastRiskModel(
+            model_config, recent_chunks=arguments.recent_chunks
+        ).to(device)
     if arguments.architecture == "spectral-gru":
         return SpectralGRURiskModel(model_config).to(device)
     if arguments.architecture == "spectral-meanpool":
@@ -308,14 +325,16 @@ def train_one_fold(
     """Train on a fold's patients, selecting the epoch on an inner patient split."""
     train_loader = DataLoader(
         ChunkFeatureDataset(train_examples, CONFIG, arguments.feature_dir,
-                            history_minutes=arguments.history_minutes),
+                            history_minutes=arguments.history_minutes,
+                            level_features=arguments.level_features),
         batch_size=arguments.batch_size, shuffle=True,
         num_workers=arguments.num_workers, pin_memory=device.type == "cuda",
         persistent_workers=arguments.num_workers > 0, drop_last=False,
     )
     inner_loader = DataLoader(
         ChunkFeatureDataset(inner_examples, CONFIG, arguments.feature_dir,
-                            history_minutes=arguments.history_minutes),
+                            history_minutes=arguments.history_minutes,
+                            level_features=arguments.level_features),
         batch_size=256, shuffle=False, num_workers=arguments.num_workers,
         persistent_workers=arguments.num_workers > 0,
     )
@@ -479,7 +498,10 @@ def main() -> None:
         mmap_mode="r",
     )
     n_features = int(sample_bank.shape[1])
-    log(f"  {n_features} features per chunk")
+    if arguments.level_features:
+        n_features *= 2
+    log(f"  {n_features} features per chunk"
+        f"{' (27 standardised + 27 recording-relative level)' if arguments.level_features else ''}")
 
     rng = np.random.default_rng(arguments.seed)
     shuffled = patients.copy()
@@ -520,7 +542,8 @@ def main() -> None:
 
         loader = DataLoader(
             ChunkFeatureDataset(test_examples, CONFIG, arguments.feature_dir,
-                                history_minutes=arguments.history_minutes),
+                                history_minutes=arguments.history_minutes,
+                                level_features=arguments.level_features),
             batch_size=256, shuffle=False, num_workers=arguments.num_workers,
             persistent_workers=arguments.num_workers > 0,
         )
