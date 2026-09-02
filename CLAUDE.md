@@ -48,6 +48,7 @@ On Unity `data/` is a symlink into a `/scratch4` workspace; the pipeline writes 
 - `data/processed/{train,validation,test}/` — final standardized shards, one set per recording (`_X.npy`, `_y.npy`, `_metadata.csv`, `_channels.json`, `_channel_availability.json`).
 - `outputs/models/eegnet_mean_pool/` — `best_model.pt` (selected on best validation **average precision**), `metrics.json`, `learning_curves.png`.
 - `outputs/evaluation/{validation,test}/` — `metrics.json`, `predictions.csv`, `operating_points.csv`, `per_patient_metrics.csv`, and the three result figures from `evaluate_model.py`.
+- `outputs/dataset_figures/` — the dataset atlas: one PNG per figure, `exemplars.json` (the examples every figure agrees to plot), `summary.json`, `recording_statistics.csv`, and a self-contained `dataset_report.html` with every figure embedded.
 
 ## Architecture
 
@@ -73,6 +74,43 @@ On Unity `data/` is a symlink into a `/scratch4` workspace; the pipeline writes 
 - Filtering is **zero-phase (noncausal)** FIR — fine for this offline baseline, but a causal variant will be required for any real-time/on-device deployment (noted in `filter_and_prepare`).
 - The native 256 Hz rate is preserved deliberately; there is no resampling, and `filter_and_prepare` asserts the rate matches `target_sfreq`.
 - Class imbalance is severe. Training subsamples negatives (`--train-negative-ratio`, default 4:1) and uses `BCEWithLogitsLoss` `pos_weight`; model selection is by validation average precision, not accuracy.
+
+## Dataset atlas
+
+`scripts/visualize_dataset.py` renders the dataset atlas into `outputs/dataset_figures/`. It is an
+orchestrator, not a monolith: each figure is its own module in `scripts/dataset_atlas/` named
+`fNN_slug.py`, exposing `NUMBER`, `SLUG`, `TITLE`, `QUESTION`, `READS`, `TAKE` and
+`render(atlas) -> Path | None`. Adding a figure means adding one file; the script discovers modules
+by name, runs them in number order, and builds the HTML report from their metadata. A module that
+fails to import or raises is reported and skipped rather than taking the whole atlas down.
+
+```bash
+.venv/bin/python scripts/visualize_dataset.py
+.venv/bin/python scripts/visualize_dataset.py --only 05 06 --no-summary --no-report   # iterate on one figure
+.venv/bin/python scripts/visualize_dataset.py --refresh-exemplars                     # re-pick the examples
+```
+
+Three shared modules carry the conventions, and figure modules must not duplicate them:
+
+- `dataset_atlas/common.py` — the palette, the axis chrome, `save()`, manifest loading, and the
+  waveform helpers (`draw_signal` with min/max plus percentile-band decimation and optional
+  clipping, `add_span`, `add_marker`, `annotate_events`, `add_scale_bar`, `channel_offsets`).
+  `save()` also warns about any axis label that carries no explicit unit.
+- `dataset_atlas/exemplars.py` — picks the hero recordings, seizures and decisions once per run,
+  verifying each by loading the samples it proposes, and caches the choice in `exemplars.json` so
+  every figure discusses the same examples.
+- `dataset_atlas/report.py` — the self-contained HTML report.
+
+**The colour budget is four hues and is not negotiable.** Slots 1-4 of the validated categorical
+palette: blue `#2a78d6` (BTE_LEFT / train / negative), orange `#eb6834` (BTE_RIGHT / validation /
+positive), aqua `#1baf7a` (CROSS_HEAD / test), violet `#4a3aa7` (the seizure itself). Those four
+clear the all-pairs colourblind-separation gate on white; adding a fifth documented slot does not
+(red against orange measures ΔE 5.6 under deuteranopia). Any further annotation class — postictal
+exclusion, impedance checks, bad segments, dropped candidates — is a neutral wash separated by
+hatch angle plus a direct in-plot label, never a new hue.
+
+Amplitude is always `z`, where 1 z is one global per-channel sigma; the microvolt conversion is
+printed beside every channel name rather than assumed.
 
 ## Ad-hoc inspection scripts
 
