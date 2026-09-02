@@ -4,15 +4,15 @@
     "h/min/s": "wall-clock duration of EEG",
     "Hz": "frequency",
     "z": "dimensionless amplitude, 1 z = 1 global channel sigma",
-    "global_sigma_volts": {
-      "BTE_LEFT": 0.00012065133014601291,
-      "BTE_RIGHT": 0.00010389141696828057,
-      "CROSS_HEAD": 9.924584642598128e-05
+    "microvolts_per_z": {
+      "BTE_LEFT": 120.65133014601291,
+      "BTE_RIGHT": 103.89141696828057,
+      "CROSS_HEAD": 99.24584642598128
     }
   },
   "patients_with_data": 121,
   "edf_files": 2494,
-  "eeg_hours": 11367.210833333334,
+  "eeg_hours": 11367.210833333338,
   "decisions": 494283,
   "positive_decisions": 3113,
   "prevalence": 0.0062980114630687275,
@@ -35,5 +35,72 @@
       "decisions": 53407,
       "positive": 330
     }
+  },
+  "figure_facts": {
+    "cohort_patients_with_data": 121,
+    "cohort_eeg_hours": 11367.2,
+    "cohort_median_hours_per_patient": 92.6,
+    "cohort_top10pct_hour_share": 22.4,
+    "cohort_hours_gini": 0.259,
+    "cohort_patients_for_half_the_hours": 41,
+    "cohort_median_file_hours": 1.6,
+    "cohort_files_without_decisions": 356,
+    "cohort_channel_present_percent": {
+      "BTE_LEFT": 67.2,
+      "BTE_RIGHT": 49.6,
+      "CROSS_HEAD": 83.2
+    },
+    "cohort_patients_without_positive": 20,
+    "mosaic_total_hours": 11367.2,
+    "mosaic_patients": 121,
+    "mosaic_files": 2494,
+    "mosaic_hours_median": 92.6,
+    "mosaic_hours_max": 397.1,
+    "mosaic_hours_min": 1.01,
+    "mosaic_top10pct_hours_share": 21.3,
+    "mosaic_top10pct_target_share": 33.8,
+    "mosaic_patients_without_target": 20,
+    "mosaic_seizures_placed": 713,
+    "mosaic_seizures_unplaceable": 170,
+    "mosaic_zoom_subject": "097",
+    "seizures_annotated": 883,
+    "seizures_eligible": 317,
+    "seizures_used_as_targets": 317,
+    "seizures_lost_to_clock_rules": 487,
+    "seizures_lost_to_data_quality": 79,
+    "seizure_median_duration_eligible_seconds": 44.0,
+    "seizure_median_duration_dropped_seconds": 26.0,
+    "seizure_eligibility_by_vigilance_percent": {
+      "awake": 45.3,
+      "asleep": 30.5,
+      "un": 13.3
+    },
+    "seizure_patients_with_seizures": 125,
+    "seizure_patients_without_target": 24,
+    "seizure_top_ten_share_percent": 29.3,
+    "labels_geometry_seizure": "sub-004_ses-01_task-szMonitoring_run-01_seizure-0002",
+    "labels_first_positive_lead_seconds": 576.0,
+    "labels_last_positive_lead_seconds": 36.0,
+    "labels_shared_fraction_first_last": 0.8,
+    "labels_n_dropped_before": 32,
+    "labels_n_dropped_after": 30,
+    "labels_positive_decisions": 3113,
+    "labels_prevalence": 0.006298,
+    "labels_targets_at_ceiling": "301 of 317",
+    "labels_prevalence_by_split": {
+      "train": 0.00633,
+      "validation": 0.00618,
+      "test": 0.0062
+    },
+    "labels_decisions_per_file_median": 32.5,
+    "labels_top5_file_share": 0.2888,
+    "hero_recording": "sub-030_ses-01_task-szMonitoring_run-05",
+    "hero_duration_hours": 20.86,
+    "hero_positive_decisions": 30,
+    "hero_decisions": 786,
+    "ladder_seizure": "sub-073_ses-01_task-szMonitoring_run-31_seizure-0000",
+    "ladder_contrast": 56.3,
+    "anatomy_decision": "sub-111_ses-01_task-szMonitoring_run-06#121",
+    "anatomy_lead_seconds": 127.0
   }
 }

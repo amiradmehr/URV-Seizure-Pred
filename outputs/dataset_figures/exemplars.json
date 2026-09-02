@@ -1,0 +1,619 @@
+{
+  "hero_recordings": [
+    {
+      "recording_id": "sub-030_ses-01_task-szMonitoring_run-05",
+      "subject": "030",
+      "split": "train",
+      "duration_seconds": 75100.0,
+      "n_decisions": 786,
+      "n_positive_decisions": 30,
+      "n_seizures": 3,
+      "n_eligible_seizures": 3,
+      "n_other_events": 3,
+      "event_types": [
+        "impd",
+        "sz_foc_a_nm"
+      ],
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "score": 68.86111111111111
+    },
+    {
+      "recording_id": "sub-097_ses-01_task-szMonitoring_run-04",
+      "subject": "097",
+      "split": "train",
+      "duration_seconds": 76313.0,
+      "n_decisions": 854,
+      "n_positive_decisions": 30,
+      "n_seizures": 3,
+      "n_eligible_seizures": 3,
+      "n_other_events": 1,
+      "event_types": [
+        "impd",
+        "sz_foc_ia_m_hyperkinetic",
+        "sz_foc_ua_m_hyperkinetic"
+      ],
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "score": 61.198055555555555
+    },
+    {
+      "recording_id": "sub-021_ses-01_task-szMonitoring_run-04",
+      "subject": "021",
+      "split": "train",
+      "duration_seconds": 74646.0,
+      "n_decisions": 833,
+      "n_positive_decisions": 30,
+      "n_seizures": 3,
+      "n_eligible_seizures": 3,
+      "n_other_events": 1,
+      "event_types": [
+        "impd",
+        "sz_foc_ia_m_hyperkinetic"
+      ],
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "score": 60.735
+    },
+    {
+      "recording_id": "sub-105_ses-01_task-szMonitoring_run-07",
+      "subject": "105",
+      "split": "validation",
+      "duration_seconds": 74827.0,
+      "n_decisions": 907,
+      "n_positive_decisions": 20,
+      "n_seizures": 2,
+      "n_eligible_seizures": 2,
+      "n_other_events": 3,
+      "event_types": [
+        "impd",
+        "sz_foc_ia_m_hyperkinetic"
+      ],
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "score": 58.78527777777778
+    },
+    {
+      "recording_id": "sub-013_ses-01_task-szMonitoring_run-01",
+      "subject": "013",
+      "split": "train",
+      "duration_seconds": 69388.0,
+      "n_decisions": 861,
+      "n_positive_decisions": 20,
+      "n_seizures": 2,
+      "n_eligible_seizures": 2,
+      "n_other_events": 3,
+      "event_types": [
+        "impd",
+        "sz_foc_ia_nm"
+      ],
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "score": 57.27444444444444
+    }
+  ],
+  "seizures": [
+    {
+      "seizure_id": "sub-073_ses-01_task-szMonitoring_run-31_seizure-0000",
+      "recording_id": "sub-073_ses-01_task-szMonitoring_run-31",
+      "subject": "073",
+      "split": "train",
+      "onset_seconds": 7346.0,
+      "duration_seconds": 116.0,
+      "event_type": "sz_foc_a_m_hyperkinetic",
+      "vigilance": "awake",
+      "lateralization": "left",
+      "localization": "front_temp",
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "ictal_mean_abs_z": 3.0260775089263916,
+      "baseline_mean_abs_z": 0.05375569313764572,
+      "contrast": 56.29315393958143,
+      "recording_duration_seconds": 21535.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-113_ses-01_task-szMonitoring_run-04_seizure-0000",
+      "recording_id": "sub-113_ses-01_task-szMonitoring_run-04",
+      "subject": "113",
+      "split": "test",
+      "onset_seconds": 39095.0,
+      "duration_seconds": 35.0,
+      "event_type": "sz_foc_a_um",
+      "vigilance": "awake",
+      "lateralization": "un",
+      "localization": "un",
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "ictal_mean_abs_z": 3.4845168590545654,
+      "baseline_mean_abs_z": 0.06601256132125854,
+      "contrast": 52.78566365720488,
+      "recording_duration_seconds": 73117.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-109_ses-01_task-szMonitoring_run-07_seizure-0003",
+      "recording_id": "sub-109_ses-01_task-szMonitoring_run-07",
+      "subject": "109",
+      "split": "validation",
+      "onset_seconds": 58779.0,
+      "duration_seconds": 16.0,
+      "event_type": "sz_foc_ia_nm",
+      "vigilance": "asleep",
+      "lateralization": "un",
+      "localization": "un",
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "ictal_mean_abs_z": 4.512548923492432,
+      "baseline_mean_abs_z": 0.10479405522346497,
+      "contrast": 43.06111557444533,
+      "recording_duration_seconds": 79725.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-062_ses-01_task-szMonitoring_run-02_seizure-0000",
+      "recording_id": "sub-062_ses-01_task-szMonitoring_run-02",
+      "subject": "062",
+      "split": "train",
+      "onset_seconds": 19269.0,
+      "duration_seconds": 27.0,
+      "event_type": "sz_foc_ua_nm",
+      "vigilance": "asleep",
+      "lateralization": "left",
+      "localization": "temp",
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "ictal_mean_abs_z": 2.629976272583008,
+      "baseline_mean_abs_z": 0.07155447453260422,
+      "contrast": 36.75488206379943,
+      "recording_duration_seconds": 51745.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-029_ses-01_task-szMonitoring_run-08_seizure-0004",
+      "recording_id": "sub-029_ses-01_task-szMonitoring_run-08",
+      "subject": "029",
+      "split": "train",
+      "onset_seconds": 46370.0,
+      "duration_seconds": 189.0,
+      "event_type": "sz_foc_f2b",
+      "vigilance": "asleep",
+      "lateralization": "left",
+      "localization": "temp",
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "ictal_mean_abs_z": 2.321258306503296,
+      "baseline_mean_abs_z": 0.07250936329364777,
+      "contrast": 32.01322148013747,
+      "recording_duration_seconds": 66398.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-115_ses-01_task-szMonitoring_run-57_seizure-0000",
+      "recording_id": "sub-115_ses-01_task-szMonitoring_run-57",
+      "subject": "115",
+      "split": "test",
+      "onset_seconds": 11186.0,
+      "duration_seconds": 98.0,
+      "event_type": "sz_foc_f2b",
+      "vigilance": "asleep",
+      "lateralization": "un",
+      "localization": "un",
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "ictal_mean_abs_z": 0.8640452027320862,
+      "baseline_mean_abs_z": 0.03252503275871277,
+      "contrast": 26.56554442671935,
+      "recording_duration_seconds": 13003.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-070_ses-01_task-szMonitoring_run-12_seizure-0000",
+      "recording_id": "sub-070_ses-01_task-szMonitoring_run-12",
+      "subject": "070",
+      "split": "train",
+      "onset_seconds": 17864.0,
+      "duration_seconds": 95.0,
+      "event_type": "sz_foc_f2b",
+      "vigilance": "awake",
+      "lateralization": "right",
+      "localization": "temp",
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "ictal_mean_abs_z": 1.7648924589157104,
+      "baseline_mean_abs_z": 0.07618197053670883,
+      "contrast": 23.166799788478617,
+      "recording_duration_seconds": 20992.0,
+      "n_positive_decisions": 10
+    },
+    {
+      "seizure_id": "sub-074_ses-01_task-szMonitoring_run-16_seizure-0000",
+      "recording_id": "sub-074_ses-01_task-szMonitoring_run-16",
+      "subject": "074",
+      "split": "train",
+      "onset_seconds": 18883.0,
+      "duration_seconds": 48.0,
+      "event_type": "sz_foc_ia_m_tonic",
+      "vigilance": "awake",
+      "lateralization": "left",
+      "localization": "temp",
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "ictal_mean_abs_z": 0.5343073010444641,
+      "baseline_mean_abs_z": 0.023424789309501648,
+      "contrast": 22.80948161304215,
+      "recording_duration_seconds": 20992.0,
+      "n_positive_decisions": 10
+    }
+  ],
+  "positives": [
+    {
+      "recording_id": "sub-074_ses-01_task-szMonitoring_run-02",
+      "subject": "074",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 54,
+      "decision_time_seconds": 5940.0,
+      "history_start_sample": 829440,
+      "decision_end_sample": 1520640,
+      "target_seizure_id": "sub-074_ses-01_task-szMonitoring_run-02_seizure-0000",
+      "seizure_onset_seconds": 6045.0,
+      "lead_seconds": 105.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "peak_abs_z": 2.5698885917663574,
+      "median_abs_z": 0.020942585542798042
+    },
+    {
+      "recording_id": "sub-066_ses-01_task-szMonitoring_run-06",
+      "subject": "066",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 363,
+      "decision_time_seconds": 24480.0,
+      "history_start_sample": 5575680,
+      "decision_end_sample": 6266880,
+      "target_seizure_id": "sub-066_ses-01_task-szMonitoring_run-06_seizure-0000",
+      "seizure_onset_seconds": 24699.0,
+      "lead_seconds": 219.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.1165233850479126,
+      "median_abs_z": 0.0554269477725029
+    },
+    {
+      "recording_id": "sub-004_ses-01_task-szMonitoring_run-01",
+      "subject": "004",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 87,
+      "decision_time_seconds": 19920.0,
+      "history_start_sample": 4408320,
+      "decision_end_sample": 5099520,
+      "target_seizure_id": "sub-004_ses-01_task-szMonitoring_run-01_seizure-0002",
+      "seizure_onset_seconds": 19956.0,
+      "lead_seconds": 36.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.3024896383285522,
+      "median_abs_z": 0.07079459726810455
+    },
+    {
+      "recording_id": "sub-024_ses-01_task-szMonitoring_run-01",
+      "subject": "024",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 453,
+      "decision_time_seconds": 33060.0,
+      "history_start_sample": 7772160,
+      "decision_end_sample": 8463360,
+      "target_seizure_id": "sub-024_ses-01_task-szMonitoring_run-01_seizure-0002",
+      "seizure_onset_seconds": 33583.0,
+      "lead_seconds": 523.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 2.196841239929199,
+      "median_abs_z": 0.08343134820461273
+    },
+    {
+      "recording_id": "sub-111_ses-01_task-szMonitoring_run-06",
+      "subject": "111",
+      "split": "validation",
+      "label": 1,
+      "decision_index_in_shard": 121,
+      "decision_time_seconds": 9960.0,
+      "history_start_sample": 1858560,
+      "decision_end_sample": 2549760,
+      "target_seizure_id": "sub-111_ses-01_task-szMonitoring_run-06_seizure-0000",
+      "seizure_onset_seconds": 10087.0,
+      "lead_seconds": 127.0,
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.5994503498077393,
+      "median_abs_z": 0.09701354801654816
+    },
+    {
+      "recording_id": "sub-100_ses-01_task-szMonitoring_run-09",
+      "subject": "100",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 29,
+      "decision_time_seconds": 4440.0,
+      "history_start_sample": 445440,
+      "decision_end_sample": 1136640,
+      "target_seizure_id": "sub-100_ses-01_task-szMonitoring_run-09_seizure-0000",
+      "seizure_onset_seconds": 4907.0,
+      "lead_seconds": 467.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.7468128204345703,
+      "median_abs_z": 0.11660370230674744
+    },
+    {
+      "recording_id": "sub-067_ses-01_task-szMonitoring_run-05",
+      "subject": "067",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 411,
+      "decision_time_seconds": 27360.0,
+      "history_start_sample": 6312960,
+      "decision_end_sample": 7004160,
+      "target_seizure_id": "sub-067_ses-01_task-szMonitoring_run-05_seizure-0000",
+      "seizure_onset_seconds": 27849.0,
+      "lead_seconds": 489.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "peak_abs_z": 31.08257293701172,
+      "median_abs_z": 0.14558972418308258
+    },
+    {
+      "recording_id": "sub-061_ses-01_task-szMonitoring_run-03",
+      "subject": "061",
+      "split": "train",
+      "label": 1,
+      "decision_index_in_shard": 267,
+      "decision_time_seconds": 18720.0,
+      "history_start_sample": 4101120,
+      "decision_end_sample": 4792320,
+      "target_seizure_id": "sub-061_ses-01_task-szMonitoring_run-03_seizure-0000",
+      "seizure_onset_seconds": 18791.0,
+      "lead_seconds": 71.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 41.0059928894043,
+      "median_abs_z": 0.47555315494537354
+    }
+  ],
+  "negatives": [
+    {
+      "recording_id": "sub-043_ses-01_task-szMonitoring_run-10",
+      "subject": "043",
+      "split": "train",
+      "label": 0,
+      "decision_index_in_shard": 943,
+      "decision_time_seconds": 59280.0,
+      "history_start_sample": 14484480,
+      "decision_end_sample": 15175680,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.2779919416061603e-05,
+      "median_abs_z": 8.878841072146315e-06
+    },
+    {
+      "recording_id": "sub-118_ses-01_task-szMonitoring_run-16",
+      "subject": "118",
+      "split": "test",
+      "label": 0,
+      "decision_index_in_shard": 183,
+      "decision_time_seconds": 13680.0,
+      "history_start_sample": 2810880,
+      "decision_end_sample": 3502080,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.5592154264450073,
+      "median_abs_z": 0.051713790744543076
+    },
+    {
+      "recording_id": "sub-070_ses-01_task-szMonitoring_run-01",
+      "subject": "070",
+      "split": "train",
+      "label": 0,
+      "decision_index_in_shard": 267,
+      "decision_time_seconds": 18720.0,
+      "history_start_sample": 4101120,
+      "decision_end_sample": 4792320,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 1.164762258529663,
+      "median_abs_z": 0.06764945387840271
+    },
+    {
+      "recording_id": "sub-114_ses-01_task-szMonitoring_run-10",
+      "subject": "114",
+      "split": "test",
+      "label": 0,
+      "decision_index_in_shard": 225,
+      "decision_time_seconds": 16200.0,
+      "history_start_sample": 3456000,
+      "decision_end_sample": 4147200,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_LEFT",
+        "BTE_RIGHT"
+      ],
+      "peak_abs_z": 2.6747231483459473,
+      "median_abs_z": 0.07827440649271011
+    },
+    {
+      "recording_id": "sub-049_ses-01_task-szMonitoring_run-01",
+      "subject": "049",
+      "split": "train",
+      "label": 0,
+      "decision_index_in_shard": 173,
+      "decision_time_seconds": 13080.0,
+      "history_start_sample": 2657280,
+      "decision_end_sample": 3348480,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 8.96376895904541,
+      "median_abs_z": 0.09398429095745087
+    },
+    {
+      "recording_id": "sub-100_ses-01_task-szMonitoring_run-13",
+      "subject": "100",
+      "split": "train",
+      "label": 0,
+      "decision_index_in_shard": 92,
+      "decision_time_seconds": 8220.0,
+      "history_start_sample": 1413120,
+      "decision_end_sample": 2104320,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 14.017789840698242,
+      "median_abs_z": 0.11820517480373383
+    },
+    {
+      "recording_id": "sub-042_ses-01_task-szMonitoring_run-04",
+      "subject": "042",
+      "split": "train",
+      "label": 0,
+      "decision_index_in_shard": 34,
+      "decision_time_seconds": 4740.0,
+      "history_start_sample": 522240,
+      "decision_end_sample": 1213440,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 11.415786743164062,
+      "median_abs_z": 0.15119382739067078
+    },
+    {
+      "recording_id": "sub-122_ses-01_task-szMonitoring_run-50",
+      "subject": "122",
+      "split": "test",
+      "label": 0,
+      "decision_index_in_shard": 2,
+      "decision_time_seconds": 2820.0,
+      "history_start_sample": 30720,
+      "decision_end_sample": 721920,
+      "target_seizure_id": null,
+      "seizure_onset_seconds": null,
+      "lead_seconds": null,
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ],
+      "peak_abs_z": 55.39945602416992,
+      "median_abs_z": 1.6240127086639404
+    }
+  ],
+  "amplitude_extremes": {
+    "quietest": {
+      "recording_id": "sub-083_ses-01_task-szMonitoring_run-35",
+      "subject": "083",
+      "split": "train",
+      "median_abs_z": 1.2779919416061603e-05,
+      "duration_seconds": 3518.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ]
+    },
+    "loudest": {
+      "recording_id": "sub-122_ses-01_task-szMonitoring_run-19",
+      "subject": "122",
+      "split": "test",
+      "median_abs_z": 1.790626049041748,
+      "duration_seconds": 3566.0,
+      "available_channels": [
+        "BTE_RIGHT",
+        "CROSS_HEAD"
+      ]
+    },
+    "median": {
+      "recording_id": "sub-009_ses-01_task-szMonitoring_run-05",
+      "subject": "009",
+      "split": "train",
+      "median_abs_z": 0.0850328803062439,
+      "duration_seconds": 76423.0,
+      "available_channels": [
+        "BTE_LEFT",
+        "CROSS_HEAD"
+      ]
+    },
+    "n_sampled": 260
+  }
+}
