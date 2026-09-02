@@ -45,3 +45,7 @@ Thumbs.db
 
 # Editor backups of job scripts
 slurm/*.bak
+
+# SLURM job-id records written by the submitting session
+.*_jobid
+.*_jobids

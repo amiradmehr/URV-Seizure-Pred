@@ -90,7 +90,7 @@ def main() -> None:
     sz["recording_id"] = sz.apply(recording_id_of, axis=1)
     elig = sz[sz["eligible_for_prediction"].astype(str).str.lower().eq("true")].copy()
 
-    X, y, groups, vig = [], [], [], []
+    X, y, groups, vig, montage, seiz_ids = [], [], [], [], [], []
     shifts = []          # per-seizure signed shift, for the direction analysis
     for n, (rec, group) in enumerate(elig.groupby("recording_id"), start=1):
         bp = a.feature_dir / f"{rec}_features.npy"
@@ -99,6 +99,10 @@ def main() -> None:
             continue
         bank = np.asarray(np.load(bp, mmap_mode="r"), dtype=np.float64)
         usable = np.load(ap).astype(bool)
+        # Electrode pair actually recorded: a patient-level attribute that
+        # explained 106% of the earlier apparent sleep effect.
+        per_ch = usable.reshape(3, -1)[:, 0]
+        pair = "+".join(n for n, f in zip(("L", "R", "X"), per_ch, strict=True) if f)
         n_chunks = bank.shape[0]
         if n_chunks < WINDOW_CHUNKS + 200:
             continue
@@ -126,7 +130,8 @@ def main() -> None:
             vec = bank[start:stop].mean(axis=0) - reference
             vec = np.where(usable, vec, 0.0)
             X.append(vec); y.append(1); groups.append(str(row.subject))
-            vig.append(str(row.vigilance))
+            vig.append(str(row.vigilance)); montage.append(pair)
+            seiz_ids.append(str(row.seizure_id))
             shifts.append({"subject": str(row.subject), "vec": vec, "usable": usable})
 
             cands = far_index[far_index >= WINDOW_CHUNKS]
@@ -139,11 +144,13 @@ def main() -> None:
                 cvec = bank[s_start:s_stop].mean(axis=0) - reference
                 X.append(np.where(usable, cvec, 0.0)); y.append(0)
                 groups.append(str(row.subject)); vig.append(str(row.vigilance))
+                montage.append(pair); seiz_ids.append(str(row.seizure_id))
         if n % 60 == 0:
             log(f"  [{n}] {int(np.sum(y))} pre-onset vectors")
 
     X = np.asarray(X); y = np.asarray(y); groups = np.asarray(groups)
-    vig = np.asarray(vig)
+    vig = np.asarray(vig); montage = np.asarray(montage)
+    seiz_ids = np.asarray(seiz_ids)
     log(f"\n{len(y)} vectors | {int(y.sum())} pre-onset | "
         f"{len(np.unique(groups))} patients | {X.shape[1]} features")
 
@@ -157,6 +164,9 @@ def main() -> None:
         model.fit(X[tr], y[tr])
         oof[te] = model.predict_proba(X[te])[:, 1]
 
+    pd.DataFrame({"seizure_id": seiz_ids, "subject": groups, "vigilance": vig,
+                  "montage": montage, "label": y, "probability": oof}
+                 ).to_csv(a.out / "signed_oof.csv", index=False)
     auc = roc_auc_score(y, oof)
     uniq = np.unique(groups)
     draws = []
