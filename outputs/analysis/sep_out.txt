@@ -1,0 +1,15 @@
+srun: job 63888145 queued and waiting for resources
+srun: job 63888145 has been allocated resources
+seizures analysed: 591 recordings: 232
+
+mean |AUC-0.5| of 10-min pre-onset window vs far-interictal baseline (27 feats, within recording):
+  ELIGIBLE (317-set)     n=269  sep=0.1952 (med 0.1887)  null=0.1460  sep-null=+0.0492
+  EXCLUDED-clustered     n=288  sep=0.2141 (med 0.2031)  null=0.1501  sep-null=+0.0640
+  EXCLUDED-short_start   n= 30  sep=0.2099 (med 0.2037)  null=0.1252  sep-null=+0.0847
+
+MWU excluded-clustered vs eligible sep: p=0.0253  A=0.555
+  restricted to clustered with prior-seizure gap >10 min (postictal-free 10-min window): n=165 sep=0.2414 p=1.27e-06 A=0.638
+  restricted to gap >60 min: n=50 sep=0.2281 p=0.0212 A=0.603
+
+sep vs null paired (eligible only): t-test p=8.46e-12, mean diff=+0.0492
+sep vs null paired (excluded-clustered): p=2.82e-16, mean diff=+0.0640

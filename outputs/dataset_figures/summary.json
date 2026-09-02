@@ -1,0 +1,39 @@
+{
+  "units": {
+    "count": "number of things (EDF files, decisions, seizures, patients)",
+    "h/min/s": "wall-clock duration of EEG",
+    "Hz": "frequency",
+    "z": "dimensionless amplitude, 1 z = 1 global channel sigma",
+    "global_sigma_volts": {
+      "BTE_LEFT": 0.00012065133014601291,
+      "BTE_RIGHT": 0.00010389141696828057,
+      "CROSS_HEAD": 9.924584642598128e-05
+    }
+  },
+  "patients_with_data": 121,
+  "edf_files": 2494,
+  "eeg_hours": 11367.210833333334,
+  "decisions": 494283,
+  "positive_decisions": 3113,
+  "prevalence": 0.0062980114630687275,
+  "seizures_annotated": 883,
+  "seizures_eligible": 317,
+  "seizures_targeted": 317,
+  "by_split": {
+    "test": {
+      "patients": 12,
+      "decisions": 48263,
+      "positive": 299
+    },
+    "train": {
+      "patients": 97,
+      "decisions": 392613,
+      "positive": 2484
+    },
+    "validation": {
+      "patients": 12,
+      "decisions": 53407,
+      "positive": 330
+    }
+  }
+}

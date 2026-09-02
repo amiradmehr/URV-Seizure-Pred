@@ -1,0 +1,7 @@
+srun: job 63891719 queued and waiting for resources
+srun: job 63891719 has been allocated resources
+restricted to the 250 recordings that hold >=1 positive: 112758 decisions, 3113 positive
+n=8000 (pos 2000 / neg 6000)
+  >0%    pos=0.850% (17/2000)  neg=0.683% (41/6000)  fisher p=0.4480
+  >50%   pos=0.000% (0/2000)  neg=0.133% (8/6000)  fisher p=0.2137
+  >=99%  pos=0.000% (0/2000)  neg=0.100% (6/6000)  fisher p=0.3472

@@ -1,0 +1,9 @@
+srun: job 63889540 queued and waiting for resources
+srun: job 63889540 has been allocated resources
+configs 46
+seizures 417 configs 46
+
+=== SEIZURE-LEVEL (unit = seizure, not config) ===
+vigilance: asleep n=166 mean=0.5252 | awake n=236 mean=0.5251 | diff=+0.0001 MWU p=0.857 Welch p=0.995
+prior-seizure: has_prior n=194 mean=0.5388 | isolated n=223 mean=0.5093 | diff=+0.0295 MWU p=0.032 Welch p=0.059
+vigilance within-patient permutation: obs diff=+0.0001  p=0.2992  null sd=0.0116

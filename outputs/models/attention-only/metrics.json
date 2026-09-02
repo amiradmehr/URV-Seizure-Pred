@@ -1,0 +1,129 @@
+{
+  "train_examples": 12420,
+  "validation_examples": 6930,
+  "train_negative_to_positive_ratio": 4.0,
+  "validation_negative_to_positive_ratio": 20.0,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 1.105222752723909,
+      "train_accuracy": 0.5253623188405797,
+      "validation_loss": 0.7410021426873806,
+      "validation_accuracy": 0.918037518037518,
+      "validation_average_precision": 0.06895786671069988,
+      "validation_roc_auc": 0.5877959136822772,
+      "validation_brier_score": 0.21989001483509615
+    },
+    {
+      "epoch": 2,
+      "train_loss": 1.1039588937052973,
+      "train_accuracy": 0.5411433172302738,
+      "validation_loss": 0.7527989128451327,
+      "validation_accuracy": 0.9194805194805195,
+      "validation_average_precision": 0.06648542747681957,
+      "validation_roc_auc": 0.5764113865932048,
+      "validation_brier_score": 0.22689298331856345
+    },
+    {
+      "epoch": 3,
+      "train_loss": 1.101248564466762,
+      "train_accuracy": 0.5426731078904992,
+      "validation_loss": 0.622468057261917,
+      "validation_accuracy": 0.9505050505050505,
+      "validation_average_precision": 0.0679500649671936,
+      "validation_roc_auc": 0.5870713957759413,
+      "validation_brier_score": 0.14585994014037454
+    },
+    {
+      "epoch": 4,
+      "train_loss": 1.097860630967575,
+      "train_accuracy": 0.5644122383252818,
+      "validation_loss": 0.6551295753681299,
+      "validation_accuracy": 0.9507936507936507,
+      "validation_average_precision": 0.06459801100932627,
+      "validation_roc_auc": 0.5943452708907255,
+      "validation_brier_score": 0.1665211358185779
+    },
+    {
+      "epoch": 5,
+      "train_loss": 1.0946280490181104,
+      "train_accuracy": 0.5649758454106281,
+      "validation_loss": 0.6043362176607525,
+      "validation_accuracy": 0.9483405483405484,
+      "validation_average_precision": 0.07022818559880598,
+      "validation_roc_auc": 0.6064054178145087,
+      "validation_brier_score": 0.13478857996020374
+    },
+    {
+      "epoch": 6,
+      "train_loss": 1.09370905926838,
+      "train_accuracy": 0.5834138486312399,
+      "validation_loss": 0.6260260520903407,
+      "validation_accuracy": 0.9382395382395382,
+      "validation_average_precision": 0.06799143429886462,
+      "validation_roc_auc": 0.5984747474747475,
+      "validation_brier_score": 0.14848623598294014
+    },
+    {
+      "epoch": 7,
+      "train_loss": 1.082698847629406,
+      "train_accuracy": 0.6056360708534622,
+      "validation_loss": 0.6066459550313963,
+      "validation_accuracy": 0.9522366522366522,
+      "validation_average_precision": 0.06120081252543058,
+      "validation_roc_auc": 0.5649763544536271,
+      "validation_brier_score": 0.1356356168317023
+    },
+    {
+      "epoch": 8,
+      "train_loss": 1.0825463567954907,
+      "train_accuracy": 0.6006441223832528,
+      "validation_loss": 0.6672715746479116,
+      "validation_accuracy": 0.8916305916305917,
+      "validation_average_precision": 0.06777091432921946,
+      "validation_roc_auc": 0.599110422405877,
+      "validation_brier_score": 0.17618071581211814
+    },
+    {
+      "epoch": 9,
+      "train_loss": 1.0764870827516688,
+      "train_accuracy": 0.6023349436392915,
+      "validation_loss": 0.5696245009076888,
+      "validation_accuracy": 0.9451659451659452,
+      "validation_average_precision": 0.060248059277772666,
+      "validation_roc_auc": 0.564431129476584,
+      "validation_brier_score": 0.11182283835530758
+    },
+    {
+      "epoch": 10,
+      "train_loss": 1.0674126218482491,
+      "train_accuracy": 0.6225442834138486,
+      "validation_loss": 0.7014612751949745,
+      "validation_accuracy": 0.8852813852813853,
+      "validation_average_precision": 0.06726674371033953,
+      "validation_roc_auc": 0.5891505968778696,
+      "validation_brier_score": 0.1978535615225721
+    },
+    {
+      "epoch": 11,
+      "train_loss": 1.063369873430034,
+      "train_accuracy": 0.6164251207729469,
+      "validation_loss": 0.6528887934412964,
+      "validation_accuracy": 0.9447330447330448,
+      "validation_average_precision": 0.04460655573405417,
+      "validation_roc_auc": 0.4787337006427915,
+      "validation_brier_score": 0.1629350289231822
+    },
+    {
+      "epoch": 12,
+      "train_loss": 1.0649105508738286,
+      "train_accuracy": 0.6072463768115942,
+      "validation_loss": 0.5773024473785494,
+      "validation_accuracy": 0.9515151515151515,
+      "validation_average_precision": 0.04178519216146022,
+      "validation_roc_auc": 0.46223461891643713,
+      "validation_brier_score": 0.11244877556115081
+    }
+  ],
+  "best_validation_average_precision": 0.07022818559880598
+}

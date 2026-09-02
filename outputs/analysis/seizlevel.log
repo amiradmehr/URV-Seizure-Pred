@@ -1,0 +1,8 @@
+srun: job 63888727 queued and waiting for resources
+srun: job 63888727 has been allocated resources
+chunk-level OOF AUC 0.8240
+seizures scored: 713
+  FA= 0.5 /h  thr=0.9937  seizure-level sensitivity ALL=  1.7%  ELIGIBLE-only=  2.2%  (n_elig=317)
+  FA= 1.0 /h  thr=0.9861  seizure-level sensitivity ALL=  3.9%  ELIGIBLE-only=  4.7%  (n_elig=317)
+  FA= 2.0 /h  thr=0.9677  seizure-level sensitivity ALL=  7.7%  ELIGIBLE-only=  8.5%  (n_elig=317)
+  FA= 6.0 /h  thr=0.8703  seizure-level sensitivity ALL= 13.6%  ELIGIBLE-only= 15.8%  (n_elig=317)

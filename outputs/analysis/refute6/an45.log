@@ -1,0 +1,18 @@
+srun: job 63891575 queued and waiting for resources
+srun: job 63891575 has been allocated resources
+CLAIM5a present-channel chunks scanned=2394086  frac log_total_power<-20 = 0.7416%  recordings_with_any=41/400 (10.2%)
+  percentiles of log_total_power (subsample n=7392): p1=-6.02 p99=1.90 min=-27.63
+  log(1e-12)=-27.6310
+
+CLAIM4 n=8000 windows (pos=2000 neg=6000)
+  max|normalized| : median=15.11 p99=96.08 max=4.124e+07
+  present-channel IQR<1e-6 : 24/8000 (0.300%)
+  max|val|>100 : 75 (0.938%)   >1000 : 3
+  IQR<1e-6 by label: pos=0.000% neg=0.400%
+  min_iqr percentiles: p0.1=0 p1=0.0156 p50=0.0852
+
+CLAIM5b dead-chunk windows
+  >0%    pos=0.650% (13/2000)  neg=0.967% (58/6000)  fisher p=0.2167
+  >=99%  pos=0.000% (0/2000)  neg=0.367% (22/6000)  fisher p=0.0025
+  windows >=99% dead come from 8 subjects / 8 recordings; total 22
+  max AUC advantage obtainable from a >=99%-dead indicator = 0.00183

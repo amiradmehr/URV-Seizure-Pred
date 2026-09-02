@@ -1,0 +1,26 @@
+srun: job 63891730 queued and waiting for resources
+srun: job 63891730 has been allocated resources
+seizures sampled: 120, subjects 81, asleep 38 awake 82
+n usable=120 subjects=81  sfreq set=[np.float64(256.0)]
+median frac of 0.5-125Hz power above 40Hz (last 10 min) = 0.1092  [IQR 0.0546-0.1771]
+
+paired log(last10 / 45-35min) per band:
+  in_0.5_40   mean=+0.021  t=+0.24 p=0.809
+  hi_40_48    mean=-0.039  t=-0.39 p=0.696
+  hi_52_70    mean=-0.033  t=-0.32 p=0.751
+  hi_70_90    mean=-0.048  t=-0.51 p=0.612
+  hi_90_125   mean=+0.002  t=+0.02 p=0.983
+
+ratio-of-ratios vs in-band:
+  hi_40_48    mean=-0.0594 t=-0.80 p=0.426
+  hi_52_70    mean=-0.0531 t=-0.69 p=0.490
+  hi_70_90    mean=-0.0690 t=-0.97 p=0.333
+  hi_90_125   mean=-0.0188 t=-0.27 p=0.788
+
+single-feature asleep-vs-awake AUC (n=120, asleep=38) -- NOT patient-held-out:
+  in_0.5_40   AUC=0.508  95%CI=[0.393,0.624]
+  hi_40_48    AUC=0.674  95%CI=[0.550,0.796]
+  hi_52_70    AUC=0.672  95%CI=[0.551,0.795]
+  hi_70_90    AUC=0.716  95%CI=[0.606,0.823]
+  hi_90_125   AUC=0.669  95%CI=[0.549,0.784]
+  paired bootstrap diff (40-48Hz minus 0.5-40Hz): mean=+0.169 95%CI=[+0.063,+0.284]  P(diff<=0)=0.001

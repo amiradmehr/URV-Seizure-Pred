@@ -1,0 +1,21 @@
+srun: job 63891688 queued and waiting for resources
+srun: job 63891688 has been allocated resources
+recordings with >=99%% dead windows: ['sub-019_ses-01_task-szMonitoring_run-06', 'sub-043_ses-01_task-szMonitoring_run-10', 'sub-045_ses-01_task-szMonitoring_run-05', 'sub-049_ses-01_task-szMonitoring_run-07', 'sub-050_ses-01_task-szMonitoring_run-04', 'sub-064_ses-01_task-szMonitoring_run-02', 'sub-078_ses-01_task-szMonitoring_run-04', 'sub-114_ses-01_task-szMonitoring_run-11']
+
+In the FULL manifest, those recordings hold:
+                                         n_decisions  n_positive
+recording_id                                                    
+sub-019_ses-01_task-szMonitoring_run-06          350           0
+sub-043_ses-01_task-szMonitoring_run-10          957           0
+sub-045_ses-01_task-szMonitoring_run-05          265           0
+sub-049_ses-01_task-szMonitoring_run-07          912           0
+sub-050_ses-01_task-szMonitoring_run-04          491           0
+sub-064_ses-01_task-szMonitoring_run-02         1009          20
+sub-078_ses-01_task-szMonitoring_run-04          187           0
+sub-114_ses-01_task-szMonitoring_run-11          210           0
+
+total positives available in those recordings: 20
+recordings holding >=1 positive decision, corpus-wide: 250 / 2494
+of the 8 dead recordings, how many hold >=1 positive: 1
+
+dead-chunk log_total_power values n=43437: min=-27.6310 max=-22.5100, frac exactly at floor(-27.6310)=0.9998

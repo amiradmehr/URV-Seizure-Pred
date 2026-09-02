@@ -1,0 +1,10 @@
+srun: job 63888146 queued and waiting for resources
+srun: job 63888146 has been allocated resources
+configs: 44
+rows: 12584 configs: 44 seizures: 286
+prior-seizure-in-recording: has_prior_seizure=0.7432 isolated=0.7014 diff=+0.0418 paired t p=1.407e-10 (n_cfg=44)
+vigilance(control): asleep=0.7239 awake=0.7102 diff=+0.0137 paired t p=0.03368 (n_cfg=44)
+patient seizure burden: high-burden(>=8 annot)=0.7070 low-burden(<8)=0.7203 diff=-0.0133 paired t p=0.04616 (n_cfg=44)
+
+Spearman(gap_to_prev_seizure_min, mean score percentile) n=85 rho=0.075 p=0.498
+Spearman(patient annotated burden, mean score percentile) n=286 rho=-0.032 p=0.585

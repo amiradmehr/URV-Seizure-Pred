@@ -1,0 +1,17 @@
+{
+  "seizures": 269,
+  "patients": 98,
+  "shams_per_seizure": 20,
+  "true_separability_mean": 0.19520021847809133,
+  "sham_separability_mean": 0.15079673001264757,
+  "delta_mean": 0.044403488465443716,
+  "delta_ci_low": 0.03271800376124533,
+  "delta_ci_high": 0.056666030430643284,
+  "fraction_true_above_sham": 0.654275092936803,
+  "delta_asleep": 0.0795684389430561,
+  "n_asleep": 102,
+  "delta_awake": 0.023013878778598455,
+  "n_awake": 156,
+  "delta_un": 0.021672048686479765,
+  "n_un": 11
+}

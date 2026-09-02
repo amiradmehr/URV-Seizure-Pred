@@ -1,0 +1,19 @@
+{
+  "train_examples": 2732,
+  "validation_examples": 363,
+  "train_negative_to_positive_ratio": 0.1,
+  "validation_negative_to_positive_ratio": 0.1,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.12707346101260114,
+      "train_accuracy": 0.551610541727672,
+      "validation_loss": 0.12789340592284504,
+      "validation_accuracy": 0.0881542699724518,
+      "validation_average_precision": 0.90609368816628,
+      "validation_roc_auc": 0.46887052341597796,
+      "validation_brier_score": 0.3138913228906665
+    }
+  ],
+  "best_validation_average_precision": 0.90609368816628
+}

@@ -1,0 +1,6 @@
+srun: job 63891769 queued and waiting for resources
+srun: job 63891769 has been allocated resources
+CLAIM2 mean-pool AUC=0.4986  subject-clustered 95%CI=[0.452,0.555]
+  label-permutation null AUC sd=0.0176 -> a true effect below ~0.549 AUC is undetectable here
+CLAIM3 RAW         all-seizure AUC=0.7728 | WITHIN-subject AUC (29 mixed subjects, 219 pairs)=0.8174
+CLAIM3 NORMALIZED  all-seizure AUC=0.5931 | WITHIN-subject AUC (29 mixed subjects, 219 pairs)=0.6073

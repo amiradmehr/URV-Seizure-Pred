@@ -1,0 +1,23 @@
+srun: job 63891676 queued and waiting for resources
+srun: job 63891676 has been allocated resources
+vigilance counts: {'awake': 190, 'asleep': 111, 'un': 12}
+n=301 asleep=111 awake=190 subjects=98
+subjects with BOTH asleep and awake seizures: 29/98 ; seizures in mixed subjects: 148/301
+
+--- RAW (no normalize_window)
+   mean       pooledOOF=0.7726  meanfold=0.7879  subj-clustered95CI=[0.695,0.847]
+   max        pooledOOF=0.7541  meanfold=0.7470  subj-clustered95CI=[0.685,0.821]
+   mean+std   pooledOOF=0.7399  meanfold=0.7406  subj-clustered95CI=[0.662,0.816]
+   q10q50q90  pooledOOF=0.7477  meanfold=0.7473  subj-clustered95CI=[0.672,0.823]
+
+--- NORMALIZED (features.normalize_window)
+   mean       pooledOOF=0.5930  meanfold=0.5963  subj-clustered95CI=[0.514,0.669]
+   max        pooledOOF=0.7074  meanfold=0.7077  subj-clustered95CI=[0.627,0.776]
+   mean+std   pooledOOF=0.6323  meanfold=0.6183  subj-clustered95CI=[0.554,0.707]
+   q10q50q90  pooledOOF=0.6285  meanfold=0.6272  subj-clustered95CI=[0.553,0.693]
+
+--- GAIN-INVARIANT band ratios, no window centring
+   mean       pooledOOF=0.7394  meanfold=0.7613  subj-clustered95CI=[0.658,0.816]
+   max        pooledOOF=0.7284  meanfold=0.7138  subj-clustered95CI=[0.650,0.812]
+   mean+std   pooledOOF=0.7329  meanfold=0.7390  subj-clustered95CI=[0.657,0.805]
+   q10q50q90  pooledOOF=0.7095  meanfold=0.7059  subj-clustered95CI=[0.634,0.781]

@@ -1,0 +1,26 @@
+srun: job 63891566 queued and waiting for resources
+srun: job 63891566 has been allocated resources
+seizure duration s: median 45.0 mean 66.1 p75 93.0 p90 134.0  frac>=300s 0.016
+ictal chunks in 540 (dur/5): median 9.0 -> dilution 60x
+
+=== ICTAL(claim1)  n_pos=313 n_neg=1600 n_subj=120
+  mean               pooledOOF_AUC=0.5225 [0.486,0.557]  meanfoldAUC=0.5478+-0.0571
+  max                pooledOOF_AUC=0.4634 [0.428,0.497]  meanfoldAUC=0.4970+-0.0494
+  p95                pooledOOF_AUC=0.5259 [0.488,0.561]  meanfoldAUC=0.5497+-0.0614
+  top10mean          pooledOOF_AUC=0.5035 [0.465,0.540]  meanfoldAUC=0.5368+-0.0834
+  last60             pooledOOF_AUC=0.7565 [0.723,0.788]  meanfoldAUC=0.7758+-0.0285
+  last120            pooledOOF_AUC=0.6510 [0.614,0.688]  meanfoldAUC=0.6836+-0.0616
+  last12             pooledOOF_AUC=0.6209 [0.582,0.660]  meanfoldAUC=0.6577+-0.0504
+  last60+contrast    pooledOOF_AUC=0.7927 [0.764,0.821]  meanfoldAUC=0.8093+-0.0270
+  last12+contrast    pooledOOF_AUC=0.6262 [0.589,0.662]  meanfoldAUC=0.6601+-0.0510
+
+=== PREICTAL(claim2)  n_pos=313 n_neg=1600 n_subj=120
+  mean               pooledOOF_AUC=0.4986 [0.464,0.532]  meanfoldAUC=0.5213+-0.0403
+  max                pooledOOF_AUC=0.4404 [0.405,0.474]  meanfoldAUC=0.4640+-0.0386
+  p95                pooledOOF_AUC=0.4318 [0.399,0.465]  meanfoldAUC=0.4559+-0.0349
+  top10mean          pooledOOF_AUC=0.4555 [0.420,0.489]  meanfoldAUC=0.4822+-0.0393
+  last60             pooledOOF_AUC=0.4597 [0.426,0.496]  meanfoldAUC=0.4933+-0.0381
+  last120            pooledOOF_AUC=0.4410 [0.408,0.474]  meanfoldAUC=0.4722+-0.0453
+  last12             pooledOOF_AUC=0.4384 [0.404,0.472]  meanfoldAUC=0.4767+-0.0330
+  last60+contrast    pooledOOF_AUC=0.5021 [0.468,0.537]  meanfoldAUC=0.5185+-0.0370
+  last12+contrast    pooledOOF_AUC=0.4796 [0.444,0.512]  meanfoldAUC=0.4951+-0.0264

@@ -1,0 +1,5 @@
+srun: job 63891927 queued and waiting for resources
+srun: job 63891927 has been allocated resources
+last-60-chunk mean pooling, end=onset+60 (ictal only)                                            n=313 AUC=0.5767
+last-60-chunk mean pooling, end=onset+300 (analyst control)                                      n=313 AUC=0.7565
+last-60-chunk mean pooling, end=onset+900 (last 60 chunks = PURE postictal, 10-15min after onset) n=288 AUC=0.5017

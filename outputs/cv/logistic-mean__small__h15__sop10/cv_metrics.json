@@ -1,0 +1,144 @@
+{
+  "tag": "logistic-mean__small__h15__sop10",
+  "architecture": "logistic-mean",
+  "folds": 5,
+  "patients": 109,
+  "decisions": 446020,
+  "positive_decisions": 2814,
+  "target_seizures": 286,
+  "prevalence": 0.006309134119546209,
+  "average_precision": 0.007120881579412226,
+  "ap_over_chance": 1.1286622608562333,
+  "roc_auc": 0.5321538048661723,
+  "brier_score": 0.24018968877140945,
+  "per_fold": [
+    {
+      "fold": 1,
+      "patients": 22,
+      "decisions": 100825,
+      "positive": 742,
+      "average_precision": 0.008855422968671584,
+      "roc_auc": 0.5098297792885813
+    },
+    {
+      "fold": 2,
+      "patients": 22,
+      "decisions": 94692,
+      "positive": 725,
+      "average_precision": 0.008695790801192515,
+      "roc_auc": 0.5058474380037307
+    },
+    {
+      "fold": 3,
+      "patients": 22,
+      "decisions": 74302,
+      "positive": 516,
+      "average_precision": 0.008669102542464203,
+      "roc_auc": 0.5418630364534185
+    },
+    {
+      "fold": 4,
+      "patients": 22,
+      "decisions": 81282,
+      "positive": 339,
+      "average_precision": 0.004053832363864182,
+      "roc_auc": 0.5025274714421748
+    },
+    {
+      "fold": 5,
+      "patients": 21,
+      "decisions": 94919,
+      "positive": 492,
+      "average_precision": 0.007658921535083072,
+      "roc_auc": 0.6515829946839822
+    }
+  ],
+  "alarm_budgets": [
+    {
+      "false_alarm_budget_per_hour": 0.1,
+      "seizure_sensitivity": 0.0,
+      "ci_low": 0.0,
+      "ci_high": 0.0,
+      "seizures_detected": 0,
+      "seizures_total": 286
+    },
+    {
+      "false_alarm_budget_per_hour": 0.25,
+      "seizure_sensitivity": 0.01048951048951049,
+      "ci_low": 0.0,
+      "ci_high": 0.024475524475524476,
+      "seizures_detected": 3,
+      "seizures_total": 286
+    },
+    {
+      "false_alarm_budget_per_hour": 0.5,
+      "seizure_sensitivity": 0.02097902097902098,
+      "ci_low": 0.006993006993006993,
+      "ci_high": 0.038461538461538464,
+      "seizures_detected": 6,
+      "seizures_total": 286
+    },
+    {
+      "false_alarm_budget_per_hour": 1.0,
+      "seizure_sensitivity": 0.03496503496503497,
+      "ci_low": 0.013986013986013986,
+      "ci_high": 0.05944055944055944,
+      "seizures_detected": 10,
+      "seizures_total": 286
+    },
+    {
+      "false_alarm_budget_per_hour": 2.0,
+      "seizure_sensitivity": 0.07692307692307693,
+      "ci_low": 0.045454545454545456,
+      "ci_high": 0.10839160839160839,
+      "seizures_detected": 22,
+      "seizures_total": 286
+    }
+  ],
+  "vigilance_at_1_per_hour": [
+    {
+      "vigilance": "asleep",
+      "seizures": 103,
+      "detected": 7,
+      "sensitivity": 0.06796116504854369
+    },
+    {
+      "vigilance": "awake",
+      "seizures": 172,
+      "detected": 3,
+      "sensitivity": 0.01744186046511628
+    },
+    {
+      "vigilance": "un",
+      "seizures": 11,
+      "detected": 0,
+      "sensitivity": 0.0
+    }
+  ],
+  "history_minutes": 15.0,
+  "sop_minutes": 10.0,
+  "chunks_used": 180,
+  "model_parameters": 91,
+  "arguments": {
+    "folds": 5,
+    "epochs": 25,
+    "batch_size": 64,
+    "learning_rate": 0.002,
+    "weight_decay": 0.001,
+    "dropout": 0.3,
+    "embedding_dim": 16,
+    "hidden_dim": 32,
+    "train_negative_ratio": 4.0,
+    "num_workers": 2,
+    "seed": 42,
+    "device": "auto",
+    "history_minutes": 15.0,
+    "sop_minutes": 10.0,
+    "architecture": "logistic-mean",
+    "tag": "logistic-mean__small__h15__sop10",
+    "feature_dir": "/work/pi_phuc_umass_edu/aradmehr/Github/URV-Seizure-Pred/data/interim/chunk_features",
+    "output_dir": "/work/pi_phuc_umass_edu/aradmehr/Github/URV-Seizure-Pred/outputs/cv",
+    "bootstrap": 2000
+  },
+  "note": "test patients (113-125) were not used"
+}

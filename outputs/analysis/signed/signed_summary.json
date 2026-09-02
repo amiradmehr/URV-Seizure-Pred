@@ -1,0 +1,15 @@
+{
+  "vectors": 2421,
+  "pre_onset": 269,
+  "patients": 98,
+  "held_out_auc": 0.5234190378795207,
+  "auc_ci_low": 0.46476166997454793,
+  "auc_ci_high": 0.5779788490904326,
+  "direction_agreement_mean": 0.3503401360544217,
+  "direction_agreement_max": 0.5306122448979592,
+  "features_above_70pct_agreement": 0,
+  "auc_awake": 0.46651051939513477,
+  "n_awake": 1404,
+  "auc_asleep": 0.6136942522106883,
+  "n_asleep": 918
+}

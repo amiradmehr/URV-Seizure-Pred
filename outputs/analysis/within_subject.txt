@@ -1,0 +1,3 @@
+subjects with both isolated and prior-seizure eligible seizures: 42  seizures: 203
+within-subject percentile: has_prior - isolated = -0.0051, paired over 44 configs, p=0.291
+  per-config diff >0 in 22/44 configs

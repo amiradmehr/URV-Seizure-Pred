@@ -1,0 +1,74 @@
+==========================================================================
+SeizeIT2 pipeline run report
+Generated: Tue Aug 18 05:11:02 UTC 2026
+==========================================================================
+
+--- SLURM stage outcomes ---
+      62948490      sz2-build            COMPLETED     01:26:38 
+      62949371   sz2-validate            COMPLETED     00:31:25 
+      62949514      sz2-smoke            COMPLETED     00:02:53 
+      62949494      sz2-train            COMPLETED     01:30:01 
+      62949495       sz2-eval            COMPLETED     00:03:20 
+      63162766   sz2-eval-cpu            COMPLETED     01:02:46 
+      63162767     sz2-report              RUNNING     00:00:02 
+
+--- Dataset ---
+shards: 2494
+raw       : 35G
+interim   : 79G
+processed : 78G
+dataset validation: PASSED (data/interim/manifests/validation_summary.csv written)
+
+--- Training ---
+epochs completed : 20
+best val AP      : 0.07290926816989514
+best epoch       : 8
+  train_loss     : 1.0026
+  val_roc_auc    : 0.5972
+  val_avg_prec   : 0.0729
+total 234
+drwxr-sr-x 2 aradmehr_umass_edu pi_phuc_umass_edu   4096 Aug 16 01:03 .
+drwxr-sr-x 2 aradmehr_umass_edu pi_phuc_umass_edu   4096 Aug 15 23:34 ..
+-rw-r--r-- 1 aradmehr_umass_edu pi_phuc_umass_edu  98293 Aug 16 00:09 best_model.pt
+-rw-r--r-- 1 aradmehr_umass_edu pi_phuc_umass_edu 132778 Aug 16 01:03 learning_curves.png
+-rw-r--r-- 1 aradmehr_umass_edu pi_phuc_umass_edu   7577 Aug 16 01:03 metrics.json
+
+--- Evaluation ---
+[validation]
+  patients          : 12
+  decisions         : 53407
+  target_seizures   : 33
+  prevalence        : 0.006178965304173611
+  average_precision : 0.009556714782789215
+  roc_auc           : 0.5946921311005566
+  brier_score       : 0.11159901611024345
+  sensitivity under alarm budget:
+    <= 0.1 /h : seizure 0.000 (0/33), decision 0.000
+    <=0.25 /h : seizure 0.000 (0/33), decision 0.000
+    <= 0.5 /h : seizure 0.000 (0/33), decision 0.000
+    <= 1.0 /h : seizure 0.061 (2/33), decision 0.021
+    <= 2.0 /h : seizure 0.091 (3/33), decision 0.070
+  files: discrimination.png metrics.json operating_characteristics.png operating_points.csv per_patient.png per_patient_metrics.csv predictions.csv 
+[test]
+  patients          : 12
+  decisions         : 48263
+  target_seizures   : 31
+  prevalence        : 0.006195222012721961
+  average_precision : 0.006369485300927784
+  roc_auc           : 0.5026343615013378
+  brier_score       : 0.14284636366487274
+  sensitivity under alarm budget:
+    <= 0.1 /h : seizure 0.000 (0/31), decision 0.000
+    <=0.25 /h : seizure 0.000 (0/31), decision 0.000
+    <= 0.5 /h : seizure 0.000 (0/31), decision 0.000
+    <= 1.0 /h : seizure 0.000 (0/31), decision 0.000
+    <= 2.0 /h : seizure 0.032 (1/31), decision 0.023
+  files: discrimination.png metrics.json operating_characteristics.png operating_points.csv per_patient.png per_patient_metrics.csv predictions.csv 
+
+--- Storage ---
+workspace: id: seizeit2      workspace directory  : /scratch4/workspace/aradmehr_umass_edu-seizeit2      remaining time       : 26 days 20 hours 
+nas003:/storage/scratch  822T  626T  197T  77% /scratch4
+
+Extend the scratch workspace before it expires:
+    ws_allocate -x -F workspace -n seizeit2 -d 30
+==========================================================================

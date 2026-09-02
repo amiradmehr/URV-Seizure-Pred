@@ -18,8 +18,11 @@ data/processed/
 # it would point at a path that does not exist on other machines.
 /data
 
-# Outputs
-outputs/
+# Outputs are tracked, EXCEPT the regenerable bulk dumps: every one of these is
+# 50-200 MB, they total ~4.5 GB, and GitHub rejects anything over 100 MB.
+# Both are reproducible from the scripts that wrote them.
+outputs/cv/*/out_of_fold_predictions.csv
+outputs/analysis/*/cache.pkl
 
 # SLURM job logs and the submitting session's job-ID record
 logs/

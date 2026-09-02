@@ -1,0 +1,81 @@
+{
+  "split": "validation",
+  "checkpoint": "/work/pi_phuc_umass_edu/aradmehr/Github/URV-Seizure-Pred/outputs/smoke_test/model/best_model.pt",
+  "decisions": 990,
+  "positive_decisions": 330,
+  "negative_decisions": 660,
+  "prevalence": 0.3333333333333333,
+  "patients": 12,
+  "target_seizures": 33,
+  "interictal_hours": 11.0,
+  "average_precision": 0.3709293015860896,
+  "roc_auc": 0.5023415977961433,
+  "brier_score": 0.23026908706661708,
+  "accuracy_at_0.5": 0.6595959595959596,
+  "best_f1_operating_point": {
+    "threshold": 0.40962451696395874,
+    "f1": 0.5,
+    "decision_sensitivity": 1.0,
+    "specificity": 0.0,
+    "precision": 0.3333333333333333,
+    "seizure_sensitivity": 1.0,
+    "false_alarms_per_hour": 60.0
+  },
+  "alarm_budgets": [
+    {
+      "false_alarm_budget_per_hour": 0.1,
+      "achievable": true,
+      "threshold": 0.643811821937561,
+      "seizure_sensitivity": 0.0,
+      "seizures_detected": 0,
+      "seizures_total": 33,
+      "decision_sensitivity": 0.0,
+      "precision": 0.0,
+      "achieved_false_alarms_per_hour": 0.09090909090909091
+    },
+    {
+      "false_alarm_budget_per_hour": 0.25,
+      "achievable": true,
+      "threshold": 0.6255314350128174,
+      "seizure_sensitivity": 0.0,
+      "seizures_detected": 0,
+      "seizures_total": 33,
+      "decision_sensitivity": 0.0,
+      "precision": 0.0,
+      "achieved_false_alarms_per_hour": 0.18181818181818182
+    },
+    {
+      "false_alarm_budget_per_hour": 0.5,
+      "achievable": true,
+      "threshold": 0.5441838502883911,
+      "seizure_sensitivity": 0.0,
+      "seizures_detected": 0,
+      "seizures_total": 33,
+      "decision_sensitivity": 0.0,
+      "precision": 0.0,
+      "achieved_false_alarms_per_hour": 0.45454545454545453
+    },
+    {
+      "false_alarm_budget_per_hour": 1.0,
+      "achievable": true,
+      "threshold": 0.48524314165115356,
+      "seizure_sensitivity": 0.09090909090909091,
+      "seizures_detected": 3,
+      "seizures_total": 33,
+      "decision_sensitivity": 0.04242424242424243,
+      "precision": 0.56,
+      "achieved_false_alarms_per_hour": 1.0
+    },
+    {
+      "false_alarm_budget_per_hour": 2.0,
+      "achievable": true,
+      "threshold": 0.4696928858757019,
+      "seizure_sensitivity": 0.09090909090909091,
+      "seizures_detected": 3,
+      "seizures_total": 33,
+      "decision_sensitivity": 0.09090909090909091,
+      "precision": 0.5769230769230769,
+      "achieved_false_alarms_per_hour": 2.0
+    }
+  ]
+}
